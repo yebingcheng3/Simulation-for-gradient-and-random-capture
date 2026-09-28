@@ -13,14 +13,23 @@ Final hybrid design from discussion:
 - Post-burst emission rate is per centrosome, adjustable from 0.1000 to 2.0000 MT/s.
 - Random MT directions: tangent cone + without-replacement angular occupancy.
 - Directed MTs: each MT independently has probability f to be directed.
+- Random, Directed, and Pivoting share one chronological growth/capture engine;
+  conditions differ through their initial direction bias and D_MT updates.
+- Pivoting uses D_MT angular diffusion: 0, 3.16e-6, 1e-5, 3.16e-5, 1e-4,
+  3.16e-4 rad^2/s.
+- Pivoting occurs only during MT growth; nonzero direction changes permit swept-shaft capture.
 - One MT can capture multiple KT units along its path.
-- Deflection angles use BOSS logic and are computed against all alive KT units.
+- Every analyzed MT exports one mean deflection row: captured MTs stop at first
+  engagement, while uncaptured MTs stop at true closest approach. Sampling is 0.25 s.
 
 Run GUI:
-    python random_directed_microtubule_kinetochore_capture_3D_simulation.py
+    python random_directed_microtubule_kinetochore_capture_3D_simulation_unified_engine.py
 
 Run direct BOSS-style output:
-    python random_directed_microtubule_kinetochore_capture_3D_simulation.py --direct
+    python random_directed_microtubule_kinetochore_capture_3D_simulation_unified_engine.py --direct
+
+Run an exact six-condition D_MT pivoting sweep:
+    python random_directed_microtubule_kinetochore_capture_3D_simulation_unified_engine.py --direct --pivoting-sweep dmt
 
 Dependencies:
     pip install PySide6
@@ -39,7 +48,7 @@ import statistics
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Sequence, Tuple
 
 try:
@@ -164,11 +173,52 @@ EXPORT_CONDITIONS: List[Tuple[str, float]] = [
     ("100% directed", 1.00),
 ]
 
+# Pivoting sweeps are deliberately separate from the unchanged
+# Random/Directed conditions above.  Zero is included as one of the six
+# conditions in each sweep; this is a user-selected graded/log-style range
+# spanning human-to-yeast-relevant values, not six direct human measurements.
+# Zero remains a pivoting-mode condition for metadata, but has no swept advantage.
+PIVOTING_DMT_CONDITIONS: List[Tuple[str, float]] = [
+    ("Pivoting D_MT = 0 rad^2/s", 0.0),
+    ("Pivoting D_MT = 3.16e-6 rad^2/s", 3.16e-6),
+    ("Pivoting D_MT = 1e-5 rad^2/s", 1e-5),
+    ("Pivoting D_MT = 3.16e-5 rad^2/s", 3.16e-5),
+    ("Pivoting D_MT = 1e-4 rad^2/s", 1e-4),
+    ("Pivoting D_MT = 3.16e-4 rad^2/s", 3.16e-4),
+]
+
+@dataclass(frozen=True)
+class ConditionSpec:
+    """One animation/export condition and its model interpretation."""
+
+    name: str
+    directed_prob: float = 0.0
+    pivoting_mode: str = "none"  # none or dmt
+    pivoting_value: float = 0.0
+    family: str = "random_directed"
+
+    @property
+    def d_mt_rad2_s(self) -> float:
+        return self.pivoting_value if self.pivoting_mode == "dmt" else 0.0
+
+def directed_condition_specs(conditions: Sequence[Tuple[str, float]]) -> List[ConditionSpec]:
+    return [ConditionSpec(name, prob) for name, prob in conditions]
+
+
+ANIMATION_CONDITIONS: List[ConditionSpec] = (
+    directed_condition_specs(CONDITIONS)
+    + [ConditionSpec(name, 0.0, "dmt", value, "pivoting_dmt") for name, value in PIVOTING_DMT_CONDITIONS]
+)
+
+PIVOT_DT_S = 1.0
+THETA_SAMPLE_DT_S = 0.25  # Independent of GUI FPS and pivot update interval.
+
 PROGRESS_MILESTONES = [0.10, 0.25, 0.50, 0.75, 0.90, 1.00]
 
 # Defaults for command-line direct output mode. These mirror the BOSS script.
 DIRECT_OUTPUT_DIR = "capture_sim_output"
 DIRECT_N_CELLS = 500
+DIRECT_N_RUNS = 3
 DIRECT_F_DIRECTED = 0.0
 
 # Random seeds are now automatic.  They are still recorded in exports for QC,
@@ -299,8 +349,13 @@ class MTRecord:
     target_index: Optional[int]
     max_len: float
     hits: List[Tuple[int, float]] = field(default_factory=list)  # (kt_index, contact_distance)
+    hit_capture_modes: List[str] = field(default_factory=list)  # plus_end or lateral_shaft
     no_hit_deflection: Optional[float] = None
     nearest_kt_index: Optional[int] = None
+    final_direction: Optional[Vec3] = None
+    pivot_step_count: int = 0
+    # For pivoting, this stores the per-MT trajectory mean (not a frame angle).
+    mean_deflection_angle: Optional[float] = None
 
 
 @dataclass
@@ -315,6 +370,11 @@ class SimulationParams:
     mt_velocity_um_s: float = 0.116
     emission_rate_per_centrosome: float = 0.15
     mt_extra_length_um: float = 1.0
+    # All conditions use the same engine; "dmt" adds angular diffusion while
+    # "none" keeps the initial direction fixed.
+    pivoting_mode: str = "none"
+    d_mt_rad2_s: float = 0.0
+    pivot_dt_s: float = PIVOT_DT_S
     # Internal auto-generated seed used only within one export/animation reset.
     seed: int = 1
 
@@ -329,6 +389,50 @@ class SimulationParams:
     @property
     def kt_effective_volume_um3(self) -> float:
         return kt_sphere_volume_um3(self.kt_diameter_um)
+
+    @property
+    def pivoting_enabled(self) -> bool:
+        return self.pivoting_mode == "dmt"
+
+
+def params_for_condition(params: SimulationParams, condition: ConditionSpec) -> SimulationParams:
+    """Return condition-specific parameters without mutating shared base params."""
+    if condition.pivoting_mode == "dmt":
+        return replace(
+            params,
+            pivoting_mode="dmt",
+            d_mt_rad2_s=max(0.0, float(condition.d_mt_rad2_s)),
+            pivot_dt_s=PIVOT_DT_S,
+        )
+    return replace(
+        params,
+        pivoting_mode="none",
+        d_mt_rad2_s=0.0,
+        pivot_dt_s=PIVOT_DT_S,
+    )
+
+
+def condition_seed_offset(condition: ConditionSpec) -> int:
+    """Conditions share initial RNG streams for paired comparisons."""
+    return 0
+
+
+def condition_metadata(condition: ConditionSpec) -> Dict[str, object]:
+    """Common export metadata, including the relevant pivoting parameter."""
+    if condition.pivoting_mode == "dmt":
+        parameter = f"D_MT={condition.d_mt_rad2_s:.6g} rad^2/s"
+    else:
+        parameter = "none"
+    return {
+        "condition": condition.name,
+        "condition_family": condition.family,
+        "directed_percent": condition.directed_prob * 100.0,
+        "pivoting_mode": condition.pivoting_mode,
+        "pivoting_parameter": parameter,
+        "d_mt_rad2_s": condition.d_mt_rad2_s,
+        "pivot_dt_s": PIVOT_DT_S,
+        "theta_sample_dt_s": THETA_SAMPLE_DT_S,
+    }
 
 # -----------------------------------------------------------------------------
 # Uniform-random KT layout generation
@@ -417,6 +521,7 @@ def max_layout_distance(units: Sequence[KTUnit]) -> float:
 
 
 def deflection_to_kt_boundary(cs_pos: Vec3, mt_dir: Vec3, kt_pos: Vec3, kt_radius: float) -> float:
+    """BOSS theta: zero inside the KT cone, otherwise angle to its nearest boundary."""
     v = v_sub(kt_pos, cs_pos)
     d = v_len(v)
     if d <= 1e-12:
@@ -446,6 +551,160 @@ def captures_along_path(cs_pos: Vec3, mt_dir: Vec3, units: Sequence[KTUnit], kt_
             if contact <= max_len + 1e-12:
                 hits.append((kt.index, contact))
     hits.sort(key=lambda item: item[1])
+    return hits
+
+
+def _great_circle_arc_basis(old_dir: Vec3, new_dir: Vec3) -> Tuple[Vec3, Vec3, float]:
+    """Return a deterministic basis for the shortest great-circle arc."""
+    start = v_norm(old_dir)
+    end = v_norm(new_dir)
+    dot = max(-1.0, min(1.0, v_dot(start, end)))
+    angle = math.acos(dot)
+    if angle <= 1e-12:
+        return start, orthonormal_basis(start)[0], 0.0
+    if math.pi - angle <= 1e-10:
+        return start, orthonormal_basis(start)[0], math.pi
+    tangent = v_norm(v_sub(end, v_mul(start, dot)))
+    return start, tangent, angle
+
+
+def _direction_on_great_circle_arc(old_dir: Vec3, new_dir: Vec3, fraction: float) -> Vec3:
+    start, tangent, angle = _great_circle_arc_basis(old_dir, new_dir)
+    if angle <= 1e-12:
+        return start
+    phi = max(0.0, min(1.0, float(fraction))) * angle
+    return v_norm(v_add(v_mul(start, math.cos(phi)), v_mul(tangent, math.sin(phi))))
+
+
+def _closest_direction_on_great_circle_arc(
+    direction: Vec3, old_dir: Vec3, new_dir: Vec3,
+) -> Tuple[float, float, Vec3]:
+    """Return minimum angle, arc fraction, and orientation closest to direction."""
+    q = v_norm(direction)
+    start, tangent, angle = _great_circle_arc_basis(old_dir, new_dir)
+    start_angle = angular_distance(q, start)
+    if angle <= 1e-12:
+        return start_angle, 0.0, start
+    end = _direction_on_great_circle_arc(old_dir, new_dir, 1.0)
+    best_angle, best_fraction, best_direction = start_angle, 0.0, start
+    end_angle = angular_distance(q, end)
+    if end_angle < best_angle:
+        best_angle, best_fraction, best_direction = end_angle, 1.0, end
+
+    plane_normal = v_norm(v_cross(start, tangent))
+    projected = v_sub(q, v_mul(plane_normal, v_dot(q, plane_normal)))
+    projected_len = v_len(projected)
+    if projected_len > 1e-12:
+        projected = v_mul(projected, 1.0 / projected_len)
+        phi = math.atan2(v_dot(projected, tangent), v_dot(projected, start))
+        if phi < 0.0:
+            phi += 2.0 * math.pi
+        if phi <= angle + 1e-12:
+            fraction = max(0.0, min(1.0, phi / angle))
+            candidate = _direction_on_great_circle_arc(old_dir, new_dir, fraction)
+            candidate_angle = angular_distance(q, candidate)
+            if candidate_angle < best_angle:
+                best_angle, best_fraction, best_direction = candidate_angle, fraction, candidate
+    return best_angle, best_fraction, best_direction
+
+
+def _minimum_angle_to_great_circle_arc(direction: Vec3, old_dir: Vec3, new_dir: Vec3) -> float:
+    return _closest_direction_on_great_circle_arc(direction, old_dir, new_dir)[0]
+
+
+def _swept_shaft_contact_geometry(
+    cs_pos: Vec3,
+    old_dir: Vec3,
+    new_dir: Vec3,
+    kt_pos: Vec3,
+    kt_radius: float,
+    max_len: float,
+) -> Optional[Tuple[float, Vec3, float]]:
+    """Return radial contact, first contact orientation, and arc fraction.
+
+    Contact orientation is the first orientation on old->new whose ray touches
+    the KT sphere. This is distinct from the post-pivot direction when contact
+    occurs partway through a swept sector.
+    """
+    max_len = max(0.0, float(max_len))
+    radius = max(0.0, float(kt_radius))
+    offset = v_sub(kt_pos, cs_pos)
+    distance = v_len(offset)
+    if distance <= radius + 1e-12:
+        return (0.0, v_norm(old_dir), 0.0) if max_len >= 0.0 else None
+    if distance <= 1e-12 or radius <= 0.0:
+        return None
+
+    q_dir = v_mul(offset, 1.0 / distance)
+    alpha = math.asin(min(1.0, radius / distance))
+    min_angle, min_fraction, _ = _closest_direction_on_great_circle_arc(q_dir, old_dir, new_dir)
+    if min_angle > alpha + 1e-12:
+        return None
+
+    if angular_distance(q_dir, v_norm(old_dir)) <= alpha + 1e-12:
+        fraction = 0.0
+        contact_direction = v_norm(old_dir)
+    else:
+        # Angle to the KT center decreases monotonically from old_dir to the
+        # closest point on the arc, so bisection locates first sphere contact.
+        lo, hi = 0.0, min_fraction
+        for _ in range(64):
+            mid = (lo + hi) / 2.0
+            candidate = _direction_on_great_circle_arc(old_dir, new_dir, mid)
+            if angular_distance(q_dir, candidate) <= alpha:
+                hi = mid
+            else:
+                lo = mid
+        fraction = hi
+        contact_direction = _direction_on_great_circle_arc(old_dir, new_dir, fraction)
+
+    delta = angular_distance(q_dir, contact_direction)
+    cos_delta = math.cos(delta)
+    if cos_delta <= 0.0:
+        return None
+    perpendicular_sq = distance * distance * max(0.0, 1.0 - cos_delta * cos_delta)
+    discriminant = radius * radius - perpendicular_sq
+    if discriminant < -1e-9:
+        return None
+    contact = distance * cos_delta - math.sqrt(max(0.0, discriminant))
+    if contact < -1e-10 or contact > max_len + 1e-10:
+        return None
+    return max(0.0, contact), contact_direction, fraction
+
+
+def _swept_shaft_contact_distance(
+    cs_pos: Vec3,
+    old_dir: Vec3,
+    new_dir: Vec3,
+    kt_pos: Vec3,
+    kt_radius: float,
+    max_len: float,
+) -> Optional[float]:
+    """Compatibility wrapper returning the swept-sector radial contact."""
+    result = _swept_shaft_contact_geometry(cs_pos, old_dir, new_dir, kt_pos, kt_radius, max_len)
+    return None if result is None else result[0]
+
+
+def captures_along_swept_shaft(
+    cs_pos: Vec3,
+    old_dir: Vec3,
+    new_dir: Vec3,
+    units: Sequence[KTUnit],
+    kt_radius: float,
+    max_len: float,
+) -> List[Tuple[int, float, Vec3]]:
+    """Return alive KTs and true first-contact orientations in a pivot sweep."""
+    hits: List[Tuple[int, float, Vec3]] = []
+    for kt in units:
+        if not kt.alive:
+            continue
+        result = _swept_shaft_contact_geometry(
+            cs_pos, old_dir, new_dir, kt.pos, kt_radius, max_len,
+        )
+        if result is not None:
+            contact, orientation, _fraction = result
+            hits.append((kt.index, contact, orientation))
+    hits.sort(key=lambda item: (item[1], item[0]))
     return hits
 
 
@@ -483,11 +742,52 @@ def sample_random_direction_with_occupancy(
     return last
 
 
+def diffuse_pivot_direction(current: Vec3, d_mt_rad2_s: float, dt_s: float, rng: random.Random) -> Vec3:
+    """One isotropic angular-diffusion update in the tangent plane.
+
+    Each of the two local tangent components has standard deviation
+    sqrt(2 * D_MT * dt), which is the small-angle form of MSAD = 2 D_MT t.
+    """
+    sigma = math.sqrt(max(0.0, 2.0 * float(d_mt_rad2_s) * max(0.0, float(dt_s))))
+    if sigma <= 0.0:
+        return v_norm(current)
+    u, v, w = orthonormal_basis(current)
+    du = rng.gauss(0.0, sigma)
+    dv = rng.gauss(0.0, sigma)
+    return v_norm(v_add(w, v_add(v_mul(u, du), v_mul(v, dv))))
+
+
+@dataclass
+class PivotingMTState:
+    """One MT trajectory in the shared chronological growth engine."""
+    record: MTRecord
+    current_direction: Vec3
+    current_length: float
+    last_time: float
+    next_pivot_time: float
+    max_growth_time: float
+    next_theta_sample_time: float
+    analysis_samples: List[Tuple[float, Vec3, Tuple[int, ...]]] = field(default_factory=list)
+    closest_approach_distance_um: float = float("inf")
+    closest_approach_time_s: Optional[float] = None
+    closest_approach_kt_index: Optional[int] = None
+    closest_approach_alive_indices: Tuple[int, ...] = ()
+    closest_approach_direction: Optional[Vec3] = None
+    deflection_finalized: bool = False
+
+
 class EventDrivenSimulator:
-    def __init__(self, params: SimulationParams, directed_prob: float, seed: int, units: Sequence[KTUnit]):
+    """Shared chronological simulator for Random, Directed, and Pivoting."""
+
+    def __init__(self, params: SimulationParams, directed_prob: float, seed: int,
+                 units: Sequence[KTUnit], *, pivot_seed: Optional[int] = None):
         self.params = params
         self.directed_prob = max(0.0, min(1.0, directed_prob))
-        self.rng = random.Random(seed)
+        # Layout is generated by generate_kt_layout(layout_seed); this stream
+        # controls only initial directions/emission target choices.
+        self.direction_rng = random.Random(seed)
+        self.rng = self.direction_rng  # Backward-compatible internal alias.
+        self.pivot_rng = random.Random(seed ^ 0x5EED5EED if pivot_seed is None else pivot_seed)
         self.units = clone_kt_units(units)
         self.max_dist = max_layout_distance(self.units)
         self.max_len = self.max_dist + params.mt_extra_length_um
@@ -500,9 +800,19 @@ class EventDrivenSimulator:
         self.capture_log: List[Dict[str, object]] = []
         self.deflection_rows: List[Dict[str, object]] = []
         self.mt_id_counter = 0
+        self.active_mts: List[PivotingMTState] = []
+        self._states_by_mt: Dict[int, PivotingMTState] = {}
 
     def alive_indices(self) -> List[int]:
         return [kt.index for kt in self.units if kt.alive]
+
+    def alive_indices_at(self, sample_time: float) -> Tuple[int, ...]:
+        """KTs alive at a time, treating an exact capture-time sample as valid."""
+        eps = 1e-10
+        return tuple(
+            kt.index for kt in self.units
+            if kt.alive or (kt.capture_time is not None and kt.capture_time >= sample_time - eps)
+        )
 
     def captured_count(self) -> int:
         return sum(1 for kt in self.units if not kt.alive)
@@ -512,13 +822,329 @@ class EventDrivenSimulator:
 
     def choose_directed_target(self) -> Optional[int]:
         alive = self.alive_indices()
-        if not alive:
-            return None
-        return self.rng.choice(alive)
+        return self.direction_rng.choice(alive) if alive else None
 
-    def emit_one(self, cs_index: int, emit_time: float) -> MTRecord:
+    def _append_analysis_sample(self, state: PivotingMTState, sample_time: float,
+                                direction: Optional[Vec3] = None) -> None:
+        if state.deflection_finalized or state.record.hits:
+            return
+        sample_direction = v_norm(direction if direction is not None else state.current_direction)
+        sample = (float(sample_time), sample_direction, self.alive_indices_at(sample_time))
+        eps = 1e-10
+        if state.analysis_samples and abs(state.analysis_samples[-1][0] - sample_time) <= eps:
+            state.analysis_samples[-1] = sample
+        else:
+            state.analysis_samples.append(sample)
+
+    def _track_uncaptured_closest_segment(
+        self, state: PivotingMTState, start_time: float, start_length: float,
+        end_time: float, end_length: float, direction: Vec3,
+    ) -> None:
+        """Track true plus-end/KT Euclidean minimum on a growing straight segment."""
+        if state.deflection_finalized or state.record.hits:
+            return
+        cs_pos = CENTROSOMES[state.record.cs_index]
+        direction = v_norm(direction)
+        velocity = max(1e-12, self.params.mt_velocity_um_s)
+        lo, hi = min(start_length, end_length), max(start_length, end_length)
+        for kt in self.units:
+            kt_hi = hi
+            if kt.capture_time is not None:
+                if kt.capture_time < start_time - 1e-10:
+                    continue
+                kt_hi = min(kt_hi, max(lo, (kt.capture_time - state.record.emit_time) * velocity))
+            if kt_hi < lo - 1e-10:
+                continue
+            offset = v_sub(kt.pos, cs_pos)
+            closest_length = max(lo, min(kt_hi, v_dot(offset, direction)))
+            plus_end = v_add(cs_pos, v_mul(direction, closest_length))
+            distance = v_len(v_sub(kt.pos, plus_end))
+            if distance < state.closest_approach_distance_um - 1e-12:
+                closest_time = state.record.emit_time + closest_length / velocity
+                alive = set(self.alive_indices_at(closest_time))
+                alive.add(kt.index)  # Preserve a terminal KT captured at this exact time.
+                state.closest_approach_distance_um = distance
+                state.closest_approach_time_s = closest_time
+                state.closest_approach_kt_index = kt.index
+                state.closest_approach_alive_indices = tuple(sorted(alive))
+                state.closest_approach_direction = direction
+
+    def _track_uncaptured_closest_arc(
+        self, state: PivotingMTState, old_direction: Vec3,
+        new_direction: Vec3, pivot_time: float,
+    ) -> None:
+        """Include the continuous plus-end arc made by a direction update."""
+        if state.deflection_finalized or state.record.hits:
+            return
+        cs_pos = CENTROSOMES[state.record.cs_index]
+        length = state.current_length
+        for kt in self.units:
+            if kt.capture_time is not None and kt.capture_time < pivot_time - 1e-10:
+                continue
+            offset = v_sub(kt.pos, cs_pos)
+            center_distance = v_len(offset)
+            if center_distance <= 1e-12:
+                direction, distance = v_norm(old_direction), length
+            else:
+                _delta, _fraction, direction = _closest_direction_on_great_circle_arc(
+                    v_mul(offset, 1.0 / center_distance), old_direction, new_direction,
+                )
+                distance_sq = (
+                    center_distance * center_distance + length * length
+                    - 2.0 * center_distance * length
+                    * max(-1.0, min(1.0, v_dot(v_mul(offset, 1.0 / center_distance), direction)))
+                )
+                distance = math.sqrt(max(0.0, distance_sq))
+            if distance < state.closest_approach_distance_um - 1e-12:
+                alive = set(self.alive_indices_at(pivot_time))
+                alive.add(kt.index)
+                state.closest_approach_distance_um = distance
+                state.closest_approach_time_s = pivot_time
+                state.closest_approach_kt_index = kt.index
+                state.closest_approach_alive_indices = tuple(sorted(alive))
+                state.closest_approach_direction = direction
+
+    def _advance_state(self, state: PivotingMTState, target_time: float) -> None:
+        """Advance growth and fixed 0.25 s analysis samples to a global event."""
+        eps = 1e-10
+        target_time = max(state.last_time, float(target_time))
+        velocity = max(1e-12, self.params.mt_velocity_um_s)
+        new_length = min(state.record.max_len, max(0.0, (target_time - state.record.emit_time) * velocity))
+        self._track_uncaptured_closest_segment(
+            state, state.last_time, state.current_length, target_time,
+            new_length, state.current_direction,
+        )
+        if not state.deflection_finalized and not state.record.hits:
+            while state.next_theta_sample_time <= target_time + eps:
+                self._append_analysis_sample(state, state.next_theta_sample_time)
+                state.next_theta_sample_time += THETA_SAMPLE_DT_S
+        state.current_length = new_length
+        state.last_time = target_time
+
+    def _next_growth_contacts(
+        self, state: PivotingMTState, limit_time: float,
+    ) -> List[Tuple[float, float, int]]:
+        """Find this MT's earliest alive-KT plus-end contacts before limit_time."""
+        velocity = max(1e-12, self.params.mt_velocity_um_s)
+        max_length = min(state.record.max_len, max(0.0, (limit_time - state.record.emit_time) * velocity))
+        hits = captures_along_path(
+            CENTROSOMES[state.record.cs_index], state.current_direction,
+            self.units, self.params.kt_radius_um, max_length,
+        )
+        eps = 1e-10
+        candidates = [
+            (max(state.last_time, state.record.emit_time + contact / velocity), contact, kt_idx)
+            for kt_idx, contact in hits
+            if contact + eps >= state.current_length
+        ]
+        if not candidates:
+            return []
+        candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+        first_time = candidates[0][0]
+        return [c for c in candidates if abs(c[0] - first_time) <= eps]
+
+    def _next_global_growth_contacts(
+        self, current_time: float, physical_limit: float,
+    ) -> Tuple[float, List[Tuple[PivotingMTState, float, float, int]]]:
+        best_time = float("inf")
+        candidates: List[Tuple[PivotingMTState, float, float, int]] = []
+        eps = 1e-10
+        for state in self.active_mts:
+            for capture_time, contact, kt_idx in self._next_growth_contacts(state, physical_limit):
+                if capture_time < current_time - eps:
+                    continue
+                if capture_time < best_time - eps:
+                    best_time = capture_time
+                    candidates = [(state, capture_time, contact, kt_idx)]
+                elif abs(capture_time - best_time) <= eps:
+                    candidates.append((state, capture_time, contact, kt_idx))
+        return best_time, candidates
+
+    def _nearest_deflection_from_indices(
+        self, cs_pos: Vec3, direction: Vec3, kt_indices: Sequence[int],
+    ) -> Tuple[Optional[float], Optional[int]]:
+        """Find the angularly nearest KT in a sample's alive set."""
+        best_angle: Optional[float] = None
+        best_idx: Optional[int] = None
+        for kt_idx in kt_indices:
+            kt = self.units[kt_idx]
+            angle = deflection_to_kt_boundary(cs_pos, direction, kt.pos, self.params.kt_radius_um)
+            if best_angle is None or angle < best_angle:
+                best_angle, best_idx = angle, kt_idx
+        return best_angle, best_idx
+
+    def _finalize_captured_mt(
+        self, state: PivotingMTState, kt_idx: int, contact: float,
+        capture_time: float, capture_mode: str, terminal_direction: Vec3,
+    ) -> None:
+        if state.deflection_finalized:
+            return
+        eps = 1e-10
+        samples = [s for s in state.analysis_samples if s[0] < capture_time - eps]
+        exact = next((s for s in reversed(state.analysis_samples) if abs(s[0] - capture_time) <= eps), None)
+        terminal = (capture_time, v_norm(terminal_direction), self.alive_indices_at(capture_time))
+        if exact is not None:
+            samples.append(terminal)
+        else:
+            samples.append(terminal)
+        if not samples:
+            samples = [(state.record.emit_time, state.record.direction, self.alive_indices_at(state.record.emit_time)), terminal]
+        cs_pos = CENTROSOMES[state.record.cs_index]
+        kt = self.units[kt_idx]
+        angles = [
+            deflection_to_kt_boundary(cs_pos, direction, kt.pos, self.params.kt_radius_um)
+            for _time, direction, _alive in samples
+        ]
+        mean_theta = statistics.fmean(angles)
+        state.deflection_finalized = True
+        state.record.mean_deflection_angle = mean_theta
+        state.record.nearest_kt_index = kt_idx
+        state.record.final_direction = state.current_direction
+        self.deflection_rows.append({
+            "mt_id": state.record.mt_id,
+            "mt_status": "captured",
+            "mean_deflection_angle_deg": mean_theta,
+            "deflection_to_boundary_deg": mean_theta,
+            "nearest_kt_index": kt_idx,
+            "nearest_is_distal": kt.is_distal,
+            "nearest_kt_group": kt.group,
+            "cs_index": state.record.cs_index,
+            "emit_time_s": state.record.emit_time,
+            "capture_time_s": capture_time,
+            "analysis_start_time_s": state.record.emit_time,
+            "analysis_end_time_s": capture_time,
+            "analysis_sample_count": len(samples),
+            "analysis_sampling_interval_s": THETA_SAMPLE_DT_S,
+            "analysis_terminal_rule": "first KT capture/engagement",
+            "analysis_nearest_rule": "the first KT captured by this MT, fixed across its trajectory",
+            "contact_distance_um": contact,
+            "capture_mode": capture_mode,
+            "first_capture_mode": capture_mode,
+            "closest_approach_time_s": "",
+            "closest_approach_distance_um": "",
+            "closest_approach_kt_index": "",
+            "is_directed": state.record.is_directed,
+            "target_kt_index": "" if state.record.target_index is None else state.record.target_index,
+            "target_is_distal": "" if state.record.target_index is None else self.units[state.record.target_index].is_distal,
+            "target_kt_group": "" if state.record.target_index is None else self.units[state.record.target_index].group,
+            "dir_x": terminal_direction[0], "dir_y": terminal_direction[1], "dir_z": terminal_direction[2],
+            "pivot_step_count": state.record.pivot_step_count,
+        })
+        state.analysis_samples.clear()
+
+    def _append_capture(
+        self, state: PivotingMTState, kt_idx: int, contact: float,
+        capture_time: float, capture_mode: str, contact_direction: Vec3,
+    ) -> None:
+        kt = self.units[kt_idx]
+        if not kt.alive:
+            return
+        kt.alive = False
+        kt.capture_time = capture_time
+        capture_index = self.captured_count()
+        state.record.hits.append((kt_idx, contact))
+        state.record.hit_capture_modes.append(capture_mode)
+        self.capture_log.append({
+            "capture_index": capture_index,
+            "captured_fraction": capture_index / float(len(self.units)),
+            "capture_time_s": capture_time,
+            "mt_total_emitted_at_capture": self.mt_id_counter,
+            "kt_index": kt_idx,
+            "is_distal": kt.is_distal,
+            "kt_group": kt.group,
+            "mt_id": state.record.mt_id,
+            "cs_index": state.record.cs_index,
+            "emit_time_s": state.record.emit_time,
+            "contact_distance_um": contact,
+            "capture_mode": capture_mode,
+            "pivoting_mode": self.params.pivoting_mode,
+            "d_mt_rad2_s": self.params.d_mt_rad2_s,
+        })
+        self._finalize_captured_mt(state, kt_idx, contact, capture_time, capture_mode, contact_direction)
+
+    def _finalize_uncaptured_mt(self, state: PivotingMTState) -> None:
+        if state.deflection_finalized or state.record.hits:
+            return
+        terminal_time = state.closest_approach_time_s
+        closest_idx = state.closest_approach_kt_index
+        if terminal_time is None or closest_idx is None:
+            # This is a defensive fallback for degenerate layouts with no alive
+            # KT at emission; every analyzed MT still receives one result row.
+            terminal_time = state.record.emit_time
+            closest_idx = self.units[0].index if self.units else None
+            state.closest_approach_alive_indices = tuple(self.alive_indices_at(terminal_time))
+            state.closest_approach_direction = state.record.direction
+            state.closest_approach_distance_um = float("nan")
+        if closest_idx is None:
+            raise RuntimeError(f"Cannot finalize MT {state.record.mt_id}: no KT units exist.")
+        terminal_direction = v_norm(state.closest_approach_direction or state.record.direction)
+        eps = 1e-10
+        samples = [sample for sample in state.analysis_samples if sample[0] < terminal_time - eps]
+        terminal_alive = set(state.closest_approach_alive_indices)
+        terminal_alive.add(closest_idx)
+        terminal_sample = (terminal_time, terminal_direction, tuple(sorted(terminal_alive)))
+        samples.append(terminal_sample)
+        if not samples:
+            samples = [(terminal_time, terminal_direction, tuple(sorted(terminal_alive)))]
+
+        cs_pos = CENTROSOMES[state.record.cs_index]
+        theta_values: List[float] = []
+        terminal_nearest_idx: Optional[int] = None
+        for sample_time, direction, alive_indices in samples:
+            angle, nearest_idx = self._nearest_deflection_from_indices(cs_pos, direction, alive_indices)
+            if angle is None or nearest_idx is None:
+                angle = deflection_to_kt_boundary(
+                    cs_pos, direction, self.units[closest_idx].pos, self.params.kt_radius_um,
+                )
+                nearest_idx = closest_idx
+            theta_values.append(angle)
+            if abs(sample_time - terminal_time) <= eps:
+                terminal_nearest_idx = nearest_idx
+        if not theta_values:
+            raise RuntimeError(f"Cannot finalize MT {state.record.mt_id}: no theta samples were available.")
+        mean_theta = statistics.fmean(theta_values)
+        terminal_nearest_idx = terminal_nearest_idx if terminal_nearest_idx is not None else closest_idx
+        nearest = self.units[terminal_nearest_idx]
+        state.deflection_finalized = True
+        state.record.no_hit_deflection = mean_theta
+        state.record.mean_deflection_angle = mean_theta
+        state.record.nearest_kt_index = terminal_nearest_idx
+        state.record.final_direction = state.current_direction
+        self.deflection_rows.append({
+            "mt_id": state.record.mt_id,
+            "mt_status": "uncaptured",
+            "mean_deflection_angle_deg": mean_theta,
+            "deflection_to_boundary_deg": mean_theta,
+            "nearest_kt_index": terminal_nearest_idx,
+            "nearest_is_distal": nearest.is_distal,
+            "nearest_kt_group": nearest.group,
+            "cs_index": state.record.cs_index,
+            "emit_time_s": state.record.emit_time,
+            "capture_time_s": "",
+            "analysis_start_time_s": state.record.emit_time,
+            "analysis_end_time_s": terminal_time,
+            "analysis_sample_count": len(theta_values),
+            "analysis_sampling_interval_s": THETA_SAMPLE_DT_S,
+            "analysis_terminal_rule": "minimum Euclidean plus-end-to-KT distance",
+            "analysis_nearest_rule": "angularly nearest KT alive at each sample; terminal classification uses the terminal sample",
+            "contact_distance_um": "",
+            "capture_mode": "",
+            "first_capture_mode": "",
+            "closest_approach_time_s": terminal_time,
+            "closest_approach_distance_um": state.closest_approach_distance_um,
+            "closest_approach_kt_index": closest_idx,
+            "is_directed": state.record.is_directed,
+            "target_kt_index": "" if state.record.target_index is None else state.record.target_index,
+            "target_is_distal": "" if state.record.target_index is None else self.units[state.record.target_index].is_distal,
+            "target_kt_group": "" if state.record.target_index is None else self.units[state.record.target_index].group,
+            "dir_x": terminal_direction[0], "dir_y": terminal_direction[1], "dir_z": terminal_direction[2],
+            "pivot_step_count": state.record.pivot_step_count,
+        })
+        state.analysis_samples.clear()
+
+    def _emit_one(self, cs_index: int, emit_time: float) -> MTRecord:
         cs_pos = CENTROSOMES[cs_index]
-        is_directed = (self.directed_prob > 0.0) and (self.rng.random() < self.directed_prob)
+        is_directed = (self.directed_prob > 0.0) and (self.direction_rng.random() < self.directed_prob)
         target_idx: Optional[int] = None
         if is_directed:
             target_idx = self.choose_directed_target()
@@ -526,108 +1152,183 @@ class EventDrivenSimulator:
                 direction = v_norm(v_sub(self.units[target_idx].pos, cs_pos))
             else:
                 direction = sample_random_direction_with_occupancy(
-                    cs_pos, self.axes[cs_index], self.halves[cs_index], self.dirs_by_cs[cs_index], self.angular_width, self.rng
+                    cs_pos, self.axes[cs_index], self.halves[cs_index],
+                    self.dirs_by_cs[cs_index], self.angular_width, self.direction_rng,
                 )
         else:
             direction = sample_random_direction_with_occupancy(
-                cs_pos, self.axes[cs_index], self.halves[cs_index], self.dirs_by_cs[cs_index], self.angular_width, self.rng
+                cs_pos, self.axes[cs_index], self.halves[cs_index],
+                self.dirs_by_cs[cs_index], self.angular_width, self.direction_rng,
             )
-
-        # BOSS rule: directed and random directions both occupy future directions.
         self.dirs_by_cs[cs_index].append(direction)
         self.mt_id_counter += 1
         mt = MTRecord(
-            mt_id=self.mt_id_counter,
-            cs_index=cs_index,
-            emit_time=emit_time,
-            direction=direction,
-            is_directed=is_directed,
-            target_index=target_idx,
+            mt_id=self.mt_id_counter, cs_index=cs_index, emit_time=emit_time,
+            direction=direction, is_directed=is_directed, target_index=target_idx,
             max_len=self.max_len,
         )
-
-        hits = captures_along_path(cs_pos, direction, self.units, self.params.kt_radius_um, self.max_len)
-        if hits:
-            mt.hits = hits
-            for kt_idx, contact in hits:
-                kt = self.units[kt_idx]
-                if not kt.alive:
-                    continue
-                kt.alive = False
-                cap_time = emit_time + contact / max(1e-12, self.params.mt_velocity_um_s)
-                kt.capture_time = cap_time
-                capture_index = self.captured_count()
-                self.capture_log.append({
-                    "capture_index": capture_index,
-                    "captured_fraction": capture_index / float(len(self.units)),
-                    "capture_time_s": cap_time,
-                    "mt_total_emitted_at_capture": self.mt_id_counter,
-                    "kt_index": kt_idx,
-                    "is_distal": kt.is_distal,
-                    "kt_group": kt.group,
-                    "mt_id": mt.mt_id,
-                    "cs_index": cs_index,
-                    "emit_time_s": emit_time,
-                    "contact_distance_um": contact,
-                })
-                self.deflection_rows.append({
-                    "mt_id": mt.mt_id,
-                    "mt_status": "captured",
-                    "deflection_to_boundary_deg": 0.0,
-                    "nearest_kt_index": kt_idx,
-                    "nearest_is_distal": kt.is_distal,
-                    "nearest_kt_group": kt.group,
-                    "cs_index": cs_index,
-                    "emit_time_s": emit_time,
-                    "capture_time_s": cap_time,
-                    "contact_distance_um": contact,
-                    "is_directed": is_directed,
-                    "target_kt_index": "" if target_idx is None else target_idx,
-                    "target_is_distal": "" if target_idx is None else self.units[target_idx].is_distal,
-                    "target_kt_group": "" if target_idx is None else self.units[target_idx].group,
-                    "dir_x": direction[0], "dir_y": direction[1], "dir_z": direction[2],
-                })
-        else:
-            angle, nearest_idx = nearest_alive_deflection(cs_pos, direction, self.units, self.params.kt_radius_um)
-            mt.no_hit_deflection = angle
-            mt.nearest_kt_index = nearest_idx
-            if angle is not None and nearest_idx is not None:
-                nearest = self.units[nearest_idx]
-                self.deflection_rows.append({
-                    "mt_id": mt.mt_id,
-                    "mt_status": "uncaptured",
-                    "deflection_to_boundary_deg": angle,
-                    "nearest_kt_index": nearest_idx,
-                    "nearest_is_distal": nearest.is_distal,
-                    "nearest_kt_group": nearest.group,
-                    "cs_index": cs_index,
-                    "emit_time_s": emit_time,
-                    "capture_time_s": "",
-                    "contact_distance_um": "",
-                    "is_directed": is_directed,
-                    "target_kt_index": "" if target_idx is None else target_idx,
-                    "target_is_distal": "" if target_idx is None else self.units[target_idx].is_distal,
-                    "target_kt_group": "" if target_idx is None else self.units[target_idx].group,
-                    "dir_x": direction[0], "dir_y": direction[1], "dir_z": direction[2],
-                })
+        velocity = max(1e-12, self.params.mt_velocity_um_s)
+        pivot_enabled = self.params.pivoting_enabled and self.params.d_mt_rad2_s > 0.0
+        state = PivotingMTState(
+            record=mt, current_direction=direction, current_length=0.0,
+            last_time=emit_time,
+            next_pivot_time=(emit_time + max(1e-12, self.params.pivot_dt_s)) if pivot_enabled else float("inf"),
+            max_growth_time=emit_time + mt.max_len / velocity,
+            next_theta_sample_time=emit_time + THETA_SAMPLE_DT_S,
+            analysis_samples=[(emit_time, direction, self.alive_indices_at(emit_time))],
+        )
+        self._track_uncaptured_closest_segment(state, emit_time, 0.0, emit_time, 0.0, direction)
         self.mt_records.append(mt)
+        self.active_mts.append(state)
+        self._states_by_mt[mt.mt_id] = state
         return mt
 
-    def run(self, max_mts: int = 500000, max_time_s: float = 200000.0) -> Dict[str, object]:
-        # First burst: 23 from each centrosome, all emit_time = 0, processed sequentially.
+    def emit_one(self, cs_index: int, emit_time: float) -> MTRecord:
+        """Backward-compatible public name for emitting a chronological MT."""
+        return self._emit_one(cs_index, emit_time)
+
+    def _process_growth_candidates(
+        self, candidates: Sequence[Tuple[PivotingMTState, float, float, int]],
+    ) -> None:
+        for state, capture_time, contact, kt_idx in sorted(
+            candidates, key=lambda c: (c[0].record.mt_id, c[1], c[2], c[3]),
+        ):
+            if self.units[kt_idx].alive:
+                self._append_capture(
+                    state, kt_idx, contact, capture_time, "plus_end", state.current_direction,
+                )
+
+    def _pivot_states_at(self, event_time: float) -> List[PivotingMTState]:
+        eps = 1e-10
+        return [
+            state for state in self.active_mts
+            if state.next_pivot_time <= event_time + eps
+            and state.next_pivot_time <= state.max_growth_time + eps
+        ]
+
+    def _process_pivots(self, states: Sequence[PivotingMTState], event_time: float) -> None:
+        if not states:
+            return
+        changed: List[Tuple[PivotingMTState, Vec3, Vec3]] = []
+        for state in sorted(states, key=lambda s: s.record.mt_id):
+            old_direction = state.current_direction
+            new_direction = diffuse_pivot_direction(
+                old_direction, self.params.d_mt_rad2_s, self.params.pivot_dt_s,
+                self.pivot_rng,
+            )
+            state.current_direction = new_direction
+            state.record.pivot_step_count += 1
+            if not state.record.hits and not state.deflection_finalized:
+                self._track_uncaptured_closest_arc(state, old_direction, new_direction, event_time)
+                self._append_analysis_sample(state, event_time, new_direction)
+            changed.append((state, old_direction, new_direction))
+            state.next_pivot_time += max(1e-12, self.params.pivot_dt_s)
+
+        swept_candidates: List[Tuple[PivotingMTState, float, float, int, Vec3]] = []
+        for state, old_direction, new_direction in changed:
+            # D_MT=0 has exactly the fixed-ray collision set; it receives no
+            # extra shaft sweep when old and new orientations are identical.
+            if angular_distance(old_direction, new_direction) <= 1e-12:
+                continue
+            hits = captures_along_swept_shaft(
+                CENTROSOMES[state.record.cs_index], old_direction, new_direction,
+                self.units, self.params.kt_radius_um, state.current_length,
+            )
+            swept_candidates.extend(
+                (state, event_time, contact, kt_idx, contact_direction)
+                for kt_idx, contact, contact_direction in hits
+            )
+        for state, capture_time, contact, kt_idx, contact_direction in sorted(
+            swept_candidates, key=lambda c: (c[0].record.mt_id, c[2], c[3]),
+        ):
+            if self.units[kt_idx].alive:
+                self._append_capture(
+                    state, kt_idx, contact, capture_time, "lateral_shaft", contact_direction,
+                )
+
+    def _run_chronological(self, max_mts: int, max_time_s: float) -> Dict[str, object]:
+        """Run every condition through the same chronological event loop."""
+        eps = 1e-10
         for _ in range(FIRST_BURST_PER_CENTROSOME):
             if not self.completed():
-                self.emit_one(0, 0.0)
+                self._emit_one(0, 0.0)
             if not self.completed():
-                self.emit_one(1, 0.0)
+                self._emit_one(1, 0.0)
 
-        dt = 1.0 / max(1e-12, self.params.emission_rate_per_centrosome)
-        t = dt
-        while (not self.completed()) and self.mt_id_counter < max_mts and t < max_time_s:
-            self.emit_one(0, t)
-            if not self.completed():
-                self.emit_one(1, t)
-            t += dt
+        emission_dt = 1.0 / max(1e-12, self.params.emission_rate_per_centrosome)
+        next_emit_time = emission_dt
+        current_time = 0.0
+        max_time_s = max(0.0, float(max_time_s))
+
+        while not self.completed() and current_time < max_time_s - eps:
+            can_emit = self.mt_id_counter < max_mts
+            physical_events = [max_time_s]
+            if can_emit:
+                physical_events.append(next_emit_time)
+            for state in self.active_mts:
+                physical_events.append(state.max_growth_time)
+                if math.isfinite(state.next_pivot_time):
+                    physical_events.append(state.next_pivot_time)
+            physical_limit = min(physical_events)
+            collision_time, collision_candidates = self._next_global_growth_contacts(
+                current_time, physical_limit,
+            )
+            event_time = min(physical_limit, collision_time)
+            if not math.isfinite(event_time) or event_time > max_time_s + eps:
+                break
+
+            if event_time > current_time + eps:
+                for state in list(self.active_mts):
+                    self._advance_state(state, event_time)
+            current_time = max(current_time, event_time)
+
+            if collision_candidates and abs(collision_time - event_time) <= eps:
+                self._process_growth_candidates(collision_candidates)
+
+            self._process_pivots(self._pivot_states_at(event_time), event_time)
+
+            for state in list(self.active_mts):
+                if state.current_length >= state.record.max_len - eps:
+                    if not state.record.hits:
+                        self._finalize_uncaptured_mt(state)
+                    else:
+                        state.record.final_direction = state.current_direction
+            self.active_mts = [
+                state for state in self.active_mts
+                if state.current_length < state.record.max_len - eps
+            ]
+
+            # Existing MT events win ties with new emissions; this preserves
+            # chronological capture ordering at a shared timestamp.
+            if self.completed():
+                break
+            if self.mt_id_counter < max_mts and next_emit_time <= current_time + eps:
+                self._emit_one(0, next_emit_time)
+                if not self.completed() and self.mt_id_counter < max_mts:
+                    self._emit_one(1, next_emit_time)
+                next_emit_time += emission_dt
+            if current_time >= max_time_s - eps:
+                break
+
+        # All emitted MTs are in the deflection analysis. At simulation stop,
+        # close any still-growing uncaptured trajectory at its observed closest
+        # approach; captured rows were finalized at first engagement.
+        for state in self.active_mts:
+            if not state.record.hits:
+                self._finalize_uncaptured_mt(state)
+            state.record.final_direction = state.current_direction
+        rows_by_mt: Dict[int, int] = {}
+        for row in self.deflection_rows:
+            rows_by_mt[int(row["mt_id"])] = rows_by_mt.get(int(row["mt_id"]), 0) + 1
+        expected_ids = {mt.mt_id for mt in self.mt_records}
+        missing = sorted(expected_ids - set(rows_by_mt))
+        duplicates = sorted(mt_id for mt_id, count in rows_by_mt.items() if count != 1)
+        if missing or duplicates or len(self.deflection_rows) != len(self.mt_records):
+            raise RuntimeError(
+                "Deflection QC failed: expected exactly one theta_mean row per emitted/analyzed MT; "
+                f"MTs={len(self.mt_records)}, rows={len(self.deflection_rows)}, "
+                f"missing={missing[:10]}, duplicate_ids={duplicates[:10]}."
+            )
 
         completed = self.completed()
         final_time = max((float(row["capture_time_s"]) for row in self.capture_log), default=0.0)
@@ -640,10 +1341,92 @@ class EventDrivenSimulator:
             "capture_log": self.capture_log,
             "deflection_rows": self.deflection_rows,
             "mt_records": self.mt_records,
+            "analysis_mt_count": len(self.mt_records),
+            "deflection_rows_count": len(self.deflection_rows),
+            "deflection_qc_passed": True,
         }
 
+    def run(self, max_mts: int = 500000, max_time_s: float = 200000.0) -> Dict[str, object]:
+        return self._run_chronological(max_mts, max_time_s)
+
+
+def run_random_vs_zero_dmt_qc(
+    params: SimulationParams, seed: int, units: Sequence[KTUnit],
+    directed_prob: float = 0.0, max_mts: int = 500000,
+    max_time_s: float = 200000.0,
+) -> Dict[str, object]:
+    """Run paired Random and D_MT=0 simulations and assert semantic identity."""
+    random_params = replace(params, pivoting_mode="none", d_mt_rad2_s=0.0)
+    zero_dmt_params = replace(params, pivoting_mode="dmt", d_mt_rad2_s=0.0)
+    random_result = EventDrivenSimulator(random_params, directed_prob, seed, units).run(max_mts, max_time_s)
+    zero_result = EventDrivenSimulator(zero_dmt_params, directed_prob, seed, units).run(max_mts, max_time_s)
+    capture_fields = (
+        "capture_index", "capture_time_s", "mt_total_emitted_at_capture", "kt_index",
+        "mt_id", "cs_index", "emit_time_s", "contact_distance_um", "capture_mode",
+    )
+    deflection_fields = (
+        "mt_id", "mt_status", "mean_deflection_angle_deg", "analysis_start_time_s",
+        "analysis_end_time_s", "analysis_sample_count", "nearest_kt_index",
+    )
+    def normalize(rows, fields):
+        return [tuple(row.get(field) for field in fields) for row in rows]
+    summaries_equal = all(
+        random_result[key] == zero_result[key]
+        for key in ("completed", "n_mts", "n_captured", "final_time_s")
+    )
+    captures_equal = normalize(random_result["capture_log"], capture_fields) == normalize(zero_result["capture_log"], capture_fields)
+    deflections_equal = normalize(random_result["deflection_rows"], deflection_fields) == normalize(zero_result["deflection_rows"], deflection_fields)
+    if not (summaries_equal and captures_equal and deflections_equal):
+        raise AssertionError(
+            "Random vs D_MT=0 paired QC failed: shared layout/initial RNG did not produce identical outputs."
+        )
+    theta_values = [float(row["mean_deflection_angle_deg"]) for row in random_result["deflection_rows"]]
+    return {
+        "passed": True,
+        "summary_equal": summaries_equal,
+        "capture_progression_equal": captures_equal,
+        "per_mt_theta_mean_equal": deflections_equal,
+        "completed": bool(random_result["completed"]),
+        "completion_time_s": float(random_result["final_time_s"]),
+        "n_mts": int(random_result["n_mts"]),
+        "capture_event_count": len(random_result["capture_log"]),
+        "deflection_row_count": len(random_result["deflection_rows"]),
+        "mean_theta_mean_deg": statistics.fmean(theta_values) if theta_values else float("nan"),
+    }
+
+
+def run_pivot_timestep_convergence(
+    params: SimulationParams, directed_prob: float, seed: int,
+    units: Sequence[KTUnit], d_mt_rad2_s: float,
+    pivot_dts: Sequence[float] = (1.0, 0.5, 0.25),
+    max_mts: int = 500000, max_time_s: float = 200000.0,
+) -> List[Dict[str, object]]:
+    """Diagnostic D_MT run across pivot timesteps; theta sampling stays 0.25 s."""
+    reports: List[Dict[str, object]] = []
+    for pivot_dt in pivot_dts:
+        sim_params = replace(
+            params, pivoting_mode="dmt", d_mt_rad2_s=max(0.0, float(d_mt_rad2_s)),
+            pivot_dt_s=max(1e-12, float(pivot_dt)),
+        )
+        result = EventDrivenSimulator(sim_params, directed_prob, seed, units).run(max_mts, max_time_s)
+        angles = [float(row["mean_deflection_angle_deg"]) for row in result["deflection_rows"]]
+        reports.append({
+            "pivot_dt_s": float(pivot_dt),
+            "theta_sample_dt_s": THETA_SAMPLE_DT_S,
+            "completed": bool(result["completed"]),
+            "completion_time_s": float(result["final_time_s"]) if result["completed"] else "",
+            "mt_total_emitted": int(result["n_mts"]),
+            "mean_theta_mean_deg": statistics.fmean(angles) if angles else float("nan"),
+            "deflection_rows_count": int(result["deflection_rows_count"]),
+            "analysis_mt_count": int(result["analysis_mt_count"]),
+            "qc_passed": bool(result["deflection_qc_passed"]),
+        })
+    return reports
+
+
 # -----------------------------------------------------------------------------
-# Animation simulation: visualizes growth, but uses BOSS-style emitted paths.
+# Animation simulation: visualizes growth with the same plus-end and swept-
+# shaft capture rules as the event-driven core.
 # -----------------------------------------------------------------------------
 @dataclass
 class VisualKT:
@@ -681,13 +1464,20 @@ class VisualMT:
     is_directed: bool
     target_index: Optional[int]
     archived: bool = False
+    current_length: float = 0.0
+    last_update_time: Optional[float] = None
+    next_pivot_time: Optional[float] = None
+    max_growth_time: Optional[float] = None
+    pivot_step_count: int = 0
 
 
 class AnimationSimulation:
     def __init__(self, params: SimulationParams, directed_prob: float, units: Sequence[KTUnit], seed: int):
         self.params = params
         self.directed_prob = directed_prob
-        self.rng = random.Random(seed)
+        self.direction_rng = random.Random(seed)
+        self.pivot_rng = random.Random(seed ^ 0x5EED5EED)
+        self.rng = self.direction_rng
         self.kt_units: List[VisualKT] = [VisualKT(u.index, u.pos, u.is_distal) for u in units]
         self.max_dist = max_layout_distance([KTUnit(k.index, k.pos, k.is_distal) for k in self.kt_units])
         self.max_len = self.max_dist + params.mt_extra_length_um
@@ -722,34 +1512,154 @@ class AnimationSimulation:
         # Reuse event collision code, mapping reserved=False to alive=True.
         return [KTUnit(k.index, k.pos, k.is_distal, alive=(not k.reserved)) for k in self.kt_units]
 
+    def _append_visual_pivot_capture(
+        self,
+        mt: VisualMT,
+        kt_idx: int,
+        contact: float,
+        capture_time: float,
+    ) -> None:
+        kt = self.kt_units[kt_idx]
+        if kt.reserved:
+            return
+        kt.reserved = True
+        kt.capture_time = capture_time
+        mt.capture_contacts.append((kt_idx, contact, capture_time))
+
+    def _visual_pivot_direction(self, mt: VisualMT) -> Vec3:
+        return diffuse_pivot_direction(
+            mt.direction,
+            self.params.d_mt_rad2_s,
+            self.params.pivot_dt_s,
+            self.pivot_rng,
+        )
+
+    def _visual_growth_contacts(self, mt: VisualMT, limit_time: float) -> List[Tuple[float, float, int]]:
+        """Find the MT's first plus-end contacts before the next global event."""
+        velocity = max(1e-12, self.params.mt_velocity_um_s)
+        max_length = min(mt.max_len, max(0.0, (limit_time - mt.emit_time) * velocity))
+        hits = captures_along_path(
+            CENTROSOMES[mt.cs_index], mt.direction, self.make_core_units_for_collision(),
+            self.params.kt_radius_um, max_length,
+        )
+        eps = 1e-10
+        candidates = [
+            (max(mt.last_update_time or mt.emit_time, mt.emit_time + contact / velocity), contact, kt_idx)
+            for kt_idx, contact in hits if contact + eps >= mt.current_length
+        ]
+        if not candidates:
+            return []
+        candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+        first_time = candidates[0][0]
+        return [candidate for candidate in candidates if abs(candidate[0] - first_time) <= eps]
+
+    def _advance_visual_physics_to(self, target_time: float) -> None:
+        """Advance all visible MTs with one global chronological event order."""
+        eps = 1e-10
+        velocity = max(1e-12, self.params.mt_velocity_um_s)
+        current_time = self.time
+        while current_time < target_time - eps:
+            events = [target_time]
+            can_emit = not self.completed()
+            if can_emit:
+                events.append(self.next_emit_time)
+            for mt in self.mts:
+                if mt.current_length < mt.max_len - eps and mt.max_growth_time is not None:
+                    events.append(mt.max_growth_time)
+                if mt.next_pivot_time is not None and math.isfinite(mt.next_pivot_time):
+                    events.append(mt.next_pivot_time)
+            physical_limit = min(events)
+
+            collision_time = float("inf")
+            collision_candidates: List[Tuple[VisualMT, float, float, int]] = []
+            for mt in self.mts:
+                if mt.current_length >= mt.max_len - eps:
+                    continue
+                for cap_time, contact, kt_idx in self._visual_growth_contacts(mt, physical_limit):
+                    if cap_time < current_time - eps:
+                        continue
+                    if cap_time < collision_time - eps:
+                        collision_time = cap_time
+                        collision_candidates = [(mt, cap_time, contact, kt_idx)]
+                    elif abs(cap_time - collision_time) <= eps:
+                        collision_candidates.append((mt, cap_time, contact, kt_idx))
+
+            event_time = min(physical_limit, collision_time)
+            for mt in self.mts:
+                mt.current_length = min(mt.max_len, max(0.0, (event_time - mt.emit_time) * velocity))
+                mt.last_update_time = event_time
+            current_time = event_time
+
+            if collision_candidates and abs(collision_time - event_time) <= eps:
+                for mt, cap_time, contact, kt_idx in sorted(
+                    collision_candidates, key=lambda c: (c[0].mt_id, c[1], c[2], c[3]),
+                ):
+                    if not self.kt_units[kt_idx].reserved:
+                        self._append_visual_pivot_capture(mt, kt_idx, contact, cap_time)
+
+            pivoting_states = [
+                mt for mt in self.mts
+                if mt.next_pivot_time is not None
+                and mt.next_pivot_time <= event_time + eps
+                and mt.next_pivot_time <= (mt.max_growth_time or float("inf")) + eps
+            ]
+            swept_candidates: List[Tuple[VisualMT, float, int]] = []
+            for mt in sorted(pivoting_states, key=lambda item: item.mt_id):
+                old_direction = mt.direction
+                new_direction = self._visual_pivot_direction(mt)
+                mt.direction = new_direction
+                mt.pivot_step_count += 1
+                mt.next_pivot_time += max(1e-12, self.params.pivot_dt_s)
+                if angular_distance(old_direction, new_direction) <= 1e-12:
+                    continue
+                hits = captures_along_swept_shaft(
+                    CENTROSOMES[mt.cs_index], old_direction, new_direction,
+                    self.make_core_units_for_collision(), self.params.kt_radius_um,
+                    mt.current_length,
+                )
+                swept_candidates.extend(
+                    (mt, contact, kt_idx)
+                    for kt_idx, contact, _contact_direction in hits
+                )
+            for mt, contact, kt_idx in sorted(
+                swept_candidates, key=lambda c: (c[0].mt_id, c[1], c[2]),
+            ):
+                if not self.kt_units[kt_idx].reserved:
+                    self._append_visual_pivot_capture(mt, kt_idx, contact, event_time)
+
+            if self.completed() is False and self.next_emit_time <= current_time + eps:
+                self.emit_visual(0, self.next_emit_time)
+                self.emit_visual(1, self.next_emit_time)
+                self.next_emit_time += 1.0 / max(1e-12, self.params.emission_rate_per_centrosome)
+            if event_time >= target_time - eps:
+                break
+            if event_time <= current_time - eps:
+                break
+
     def emit_visual(self, cs_index: int, emit_time: float) -> Optional[VisualMT]:
         if self.completed():
             return None
         cs_pos = CENTROSOMES[cs_index]
-        is_directed = (self.directed_prob > 0.0) and (self.rng.random() < self.directed_prob)
+        is_directed = (self.directed_prob > 0.0) and (self.direction_rng.random() < self.directed_prob)
         target_idx: Optional[int] = None
         if is_directed and self.reserved_alive_indices():
-            target_idx = self.rng.choice(self.reserved_alive_indices())
+            target_idx = self.direction_rng.choice(self.reserved_alive_indices())
             direction = v_norm(v_sub(self.kt_units[target_idx].pos, cs_pos))
         else:
             direction = sample_random_direction_with_occupancy(
-                cs_pos, self.axes[cs_index], self.halves[cs_index], self.dirs_by_cs[cs_index], self.angular_width, self.rng
+                cs_pos, self.axes[cs_index], self.halves[cs_index], self.dirs_by_cs[cs_index], self.angular_width, self.direction_rng
             )
             is_directed = False if target_idx is None else is_directed
         self.dirs_by_cs[cs_index].append(direction)
-        core_units = self.make_core_units_for_collision()
-        hits = captures_along_path(cs_pos, direction, core_units, self.params.kt_radius_um, self.max_len)
-        contacts: List[Tuple[int, float, float]] = []
-        for kt_idx, contact in hits:
-            k = self.kt_units[kt_idx]
-            if k.reserved:
-                continue
-            k.reserved = True
-            cap_time = emit_time + contact / max(1e-12, self.params.mt_velocity_um_s)
-            k.capture_time = cap_time
-            contacts.append((kt_idx, contact, cap_time))
         self.mt_id_counter += 1
-        mt = VisualMT(self.mt_id_counter, cs_index, emit_time, direction, self.max_len, contacts, is_directed, target_idx)
+        pivot_enabled = self.params.pivoting_enabled and self.params.d_mt_rad2_s > 0.0
+        mt = VisualMT(
+            self.mt_id_counter, cs_index, emit_time, direction, self.max_len, [], is_directed, target_idx,
+            current_length=0.0,
+            last_update_time=emit_time,
+            next_pivot_time=(emit_time + max(1e-12, self.params.pivot_dt_s)) if pivot_enabled else None,
+            max_growth_time=emit_time + self.max_len / max(1e-12, self.params.mt_velocity_um_s),
+        )
         self.mts.append(mt)
         return mt
 
@@ -766,12 +1676,9 @@ class AnimationSimulation:
             self.emit_first_burst()
         if self.completed() and not self.mts:
             return
-        self.time += dt
-        # BOSS post-burst: every interval, one MT from each centrosome.
-        while (not self.completed()) and self.time + 1e-12 >= self.next_emit_time:
-            self.emit_visual(0, self.next_emit_time)
-            self.emit_visual(1, self.next_emit_time)
-            self.next_emit_time += 1.0 / max(1e-12, self.params.emission_rate_per_centrosome)
+        target_time = self.time + max(0.0, float(dt))
+        self._advance_visual_physics_to(target_time)
+        self.time = target_time
         # Update displayed capture status, KT retraction display, and archive old MTs.
         still_live: List[VisualMT] = []
         for mt in self.mts:
@@ -909,6 +1816,8 @@ class SimulationView(QWidget):
     def current_mt_length(self, mt: VisualMT) -> float:
         if self.sim is None:
             return 0.0
+        if self.sim.params.pivoting_enabled:
+            return max(0.0, min(mt.max_len, mt.current_length))
         return max(0.0, min(mt.max_len, (self.sim.time - mt.emit_time) * self.sim.params.mt_velocity_um_s))
 
     def paintEvent(self, event):
@@ -1431,7 +2340,7 @@ class DualComparisonExportWidget(QWidget):
 
     def __init__(
         self,
-        conditions: Sequence[Tuple[str, float]],
+        conditions: Sequence[ConditionSpec],
         sims: Sequence[AnimationSimulation],
         source_views: Optional[Sequence[SimulationView]] = None,
         parent: Optional[QWidget] = None,
@@ -1511,7 +2420,7 @@ class DualComparisonExportWidget(QWidget):
             module_visual_layout.addWidget(animation_panel, 2)
             module_visual_layout.addLayout(plot_col, 1)
 
-            name = str(self.conditions[i][0]).replace(" directed", " Directed")
+            name = str(self.conditions[i].name).replace(" directed", " Directed")
             condition_title = QLabel(name)
             condition_title.setAlignment(Qt.AlignCenter)
             condition_title.setFont(QFont(DISPLAY_FONT_FAMILY, visual_font_size(20)))
@@ -1627,9 +2536,9 @@ def generate_superplot_ready_tables(
     """Create Prism/superplot-ready tables from raw export rows.
 
     Files are written under Superplot_ready_tables/.
-    - Raw metric tables keep repeats/encounters vertically and conditions horizontally.
-    - Capture progression keeps condition blocks horizontally, with all repeats stacked vertically.
-    - Average tables summarize across all repeats/encounters for quick review.
+    - Raw metric tables keep run/cell records vertically and conditions horizontally.
+    - Capture progression keeps condition blocks horizontally, with all cells stacked vertically.
+    - Average tables summarize across all cells/encounters for quick review.
     Returns a lightweight QC log as a list of text lines.
     """
     super_dir = os.path.join(output_dir, "Superplot_ready_tables")
@@ -1638,6 +2547,8 @@ def generate_superplot_ready_tables(
     qc_lines: List[str] = []
     qc_lines.append("Superplot-ready table QC")
     qc_lines.append(f"Conditions: {', '.join(conditions)}")
+    run_ids = sorted({str(r.get("run", "1")) for r in summary_rows})
+    qc_lines.append(f"Independent runs represented: {', '.join(run_ids)}")
 
     # 1. Completion time and emitted MT count, one value per repeat/cell.
     completion_by_cond: Dict[str, List[object]] = {c: [] for c in conditions}
@@ -1660,8 +2571,8 @@ def generate_superplot_ready_tables(
         qc_lines.append(f"{cond}: deflection encounters = {len(rows)}")
     write_matrix_csv(os.path.join(super_dir, "Superplot_deflection_angle_deg.csv"), _wide_columns_by_condition(defl_by_cond, conditions))
 
-    # 3. Capture progression by repeat: each condition occupies 3 columns; repeats stack downward.
-    #    Every repeat should have exactly 46 capture records under normal completed runs.
+    # 3. Capture progression by cell: each condition occupies 3 columns; cells stack downward.
+    #    Every completed cell should have exactly 46 capture records.
     # Normalize progression chronologically. During the first burst, multiple MTs
     # have emit_time=0 and the event loop processes them sequentially; the raw
     # capture_index is therefore a processing rank, not always a chronological
@@ -1914,20 +2825,29 @@ def run_boss_style_direct_output(
     n_cells: int = DIRECT_N_CELLS,
     output_dir: str = DIRECT_OUTPUT_DIR,
     progress_milestones: Sequence[float] = PROGRESS_MILESTONES,
-) -> None:
+    condition: Optional[ConditionSpec] = None,
+    n_runs: int = 1,
+) -> Dict[str, object]:
     """Run without GUI and export the same core files as the BOSS script.
 
     Output files:
-      - cell_XXX_progression.csv
+      - cell_XXXX_progression.csv
       - aggregate_progression.csv
       - per_cell_summary.csv
+      - run_summary.csv
       - distal_angles.csv
 
     Console output mirrors the BOSS summary: completion count, MT count/time,
     distal/all deflection statistics, and milestone time/MT summaries.
     """
     os.makedirs(output_dir, exist_ok=True)
-    condition_label = _condition_label_from_prob(directed_prob)
+    n_cells = max(1, int(n_cells))
+    n_runs = max(1, int(n_runs))
+    total_cells = n_cells * n_runs
+    if condition is None:
+        condition = ConditionSpec(_condition_label_from_prob(directed_prob), directed_prob)
+    sim_params = params_for_condition(params, condition)
+    condition_label = condition.name
 
     print("=" * 70)
     print("3D Random Search-and-Capture Simulation (Hybrid KT-unit direct mode)")
@@ -1935,17 +2855,18 @@ def run_boss_style_direct_output(
     print(f"细胞核: {NUC_LONG_AXIS:.2f} x {NUC_INTERMEDIATE_AXIS:.2f} x {NUC_SHORT_AXIS:.2f} um")
     print(f"中心体间距: {CENTROSOME_DISTANCE:.2f} um")
     print(f"KT units: {TOTAL_KT_UNITS} ({DISTAL_KT_UNITS} distal, {PROXIMAL_KT_UNITS} proximal)")
-    print(f"KT generation: {params.kt_generation_mode}")
+    print(f"KT generation: {sim_params.kt_generation_mode}")
     print(
-        f"KT base diameter: {params.kt_base_diameter_um:.3f} um | "
-        f"volume multiplier: {params.kt_volume_multiplier:.2f}x | "
-        f"effective KT diameter: {params.kt_diameter_um:.3f} um | "
-        f"effective KT volume: {params.kt_effective_volume_um3:.3f} um^3"
+        f"KT base diameter: {sim_params.kt_base_diameter_um:.3f} um | "
+        f"volume multiplier: {sim_params.kt_volume_multiplier:.2f}x | "
+        f"effective KT diameter: {sim_params.kt_diameter_um:.3f} um | "
+        f"effective KT volume: {sim_params.kt_effective_volume_um3:.3f} um^3"
     )
-    print(f"MT 直径: {params.mt_diameter_um * 1000:.0f} nm | MT 速度: {params.mt_velocity_um_s:.3f} um/s")
-    print(f"发出: burst {FIRST_BURST_PER_CENTROSOME}/中心体, 之后 {params.emission_rate_per_centrosome:.4f} 根/s/中心体")
-    print(f"定向程度 f: {directed_prob * 100:.0f}% ({'纯random' if directed_prob == 0 else '全部定向' if directed_prob == 1 else '混合'})")
-    print(f"模拟细胞数: {n_cells}")
+    print(f"MT 直径: {sim_params.mt_diameter_um * 1000:.0f} nm | MT 速度: {sim_params.mt_velocity_um_s:.3f} um/s")
+    print(f"发出: burst {FIRST_BURST_PER_CENTROSOME}/中心体, 之后 {sim_params.emission_rate_per_centrosome:.4f} 根/s/中心体")
+    print(f"定向程度 f: {condition.directed_prob * 100:.0f}% ({'纯random' if condition.directed_prob == 0 else '全部定向' if condition.directed_prob == 1 else '混合'})")
+    print(f"条件组: {condition.family} | pivoting: {condition_metadata(condition)['pivoting_parameter']}")
+    print(f"独立运行次数: {n_runs} | 每次运行细胞数: {n_cells} | 总细胞数: {total_cells}")
     print("=" * 70)
     print()
 
@@ -1958,78 +2879,91 @@ def run_boss_style_direct_output(
     milestone_mts: Dict[float, List[int]] = {m: [] for m in progress_milestones}
     per_cell_summary: List[Dict[str, object]] = []
 
-    for c in range(n_cells):
-        cell_index = c + 1
-        layout_seed = params.seed + cell_index * 100003
-        sim_seed = params.seed + cell_index * 100003 + int(round(directed_prob * 1000)) + 17
+    for run_index in range(1, n_runs + 1):
+        for c in range(n_cells):
+            cell_index = c + 1
+            global_cell_index = (run_index - 1) * n_cells + cell_index
+            layout_seed = params.seed + global_cell_index * 100003
+            sim_seed = params.seed + global_cell_index * 100003 + 17
 
-        try:
-            kt_layout = generate_kt_layout(params, layout_seed)
-        except Exception as e:
-            print(f"  Cell {cell_index}: KT 放置失败,跳过 ({e})")
-            continue
-
-        sim = EventDrivenSimulator(params, directed_prob, sim_seed, kt_layout)
-        result = sim.run()
-        completed = bool(result["completed"])
-        n_mts = int(result["n_mts"])
-        n_captured = int(result["n_captured"])
-        final_time = float(result["final_time_s"])
-
-        if completed:
-            completed_count += 1
-            mt_counts.append(n_mts)
-            times.append(final_time)
-
-        for row in result["deflection_rows"]:
             try:
-                ang = float(row["deflection_to_boundary_deg"])
-            except Exception:
+                kt_layout = generate_kt_layout(sim_params, layout_seed)
+            except Exception as e:
+                print(f"  Run {run_index}, cell {cell_index}: KT 放置失败,跳过 ({e})")
                 continue
-            all_angles.append(ang)
-            if bool(row.get("nearest_is_distal", False)):
-                all_dist_angles.append(ang)
 
-        capture_log = list(result["capture_log"])
-        cell_file = os.path.join(output_dir, f"cell_{cell_index:03d}_progression.csv")
-        with open(cell_file, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.writer(f)
-            writer.writerow(["capture_index", "fraction_captured", "time_s", "n_mts_emitted"])
-            for row in capture_log:
-                capture_index = int(row["capture_index"])
+            sim = EventDrivenSimulator(sim_params, condition.directed_prob, sim_seed, kt_layout)
+            result = sim.run()
+            completed = bool(result["completed"])
+            n_mts = int(result["n_mts"])
+            n_captured = int(result["n_captured"])
+            final_time = float(result["final_time_s"])
+
+            if completed:
+                completed_count += 1
+                mt_counts.append(n_mts)
+                times.append(final_time)
+
+            for row in result["deflection_rows"]:
+                try:
+                    ang = float(row["deflection_to_boundary_deg"])
+                except Exception:
+                    continue
+                all_angles.append(ang)
+                if bool(row.get("nearest_is_distal", False)):
+                    all_dist_angles.append(ang)
+
+            capture_log = list(result["capture_log"])
+            cell_file = os.path.join(output_dir, f"cell_{global_cell_index:04d}_progression.csv")
+            with open(cell_file, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
                 writer.writerow([
-                    capture_index,
-                    f"{capture_index / TOTAL_KT_UNITS:.4f}",
-                    f"{float(row['capture_time_s']):.2f}",
-                    int(row["mt_total_emitted_at_capture"]),
+                    "run", "cell", "global_cell", "capture_index",
+                    "fraction_captured", "time_s", "n_mts_emitted",
+                    "condition", "condition_family", "pivoting_mode",
+                    "d_mt_rad2_s",
                 ])
+                for row in capture_log:
+                    capture_index = int(row["capture_index"])
+                    writer.writerow([
+                        run_index, cell_index, global_cell_index, capture_index,
+                        f"{capture_index / TOTAL_KT_UNITS:.4f}",
+                        f"{float(row['capture_time_s']):.2f}",
+                        int(row["mt_total_emitted_at_capture"]),
+                        condition.name,
+                        condition.family,
+                        condition.pivoting_mode,
+                        condition.d_mt_rad2_s,
+                    ])
 
-        for m in progress_milestones:
-            target = int(math.ceil(m * TOTAL_KT_UNITS))
-            rec = next((row for row in capture_log if int(row["capture_index"]) >= target), None)
-            if rec is not None:
-                milestone_times[m].append(float(rec["capture_time_s"]))
-                milestone_mts[m].append(int(rec["mt_total_emitted_at_capture"]))
+            for m in progress_milestones:
+                target = int(math.ceil(m * TOTAL_KT_UNITS))
+                rec = next((row for row in capture_log if int(row["capture_index"]) >= target), None)
+                if rec is not None:
+                    milestone_times[m].append(float(rec["capture_time_s"]))
+                    milestone_mts[m].append(int(rec["mt_total_emitted_at_capture"]))
 
-        per_cell_summary.append({
-            "cell": cell_index,
-            "completed": completed,
-            "n_mts": n_mts,
-            "n_captured": n_captured,
-            "final_time": final_time,
-            "layout_seed": layout_seed,
-            "simulation_seed": sim_seed,
-            "condition": condition_label,
-        })
+            per_cell_summary.append({
+                "run": run_index,
+                "cell": cell_index,
+                "global_cell": global_cell_index,
+                "completed": completed,
+                "n_mts": n_mts,
+                "n_captured": n_captured,
+                "final_time": final_time,
+                "layout_seed": layout_seed,
+                "simulation_seed": sim_seed,
+                **condition_metadata(condition),
+            })
 
-        if cell_index % 10 == 0:
-            print(f"  已完成 {cell_index}/{n_cells} 个细胞...")
+            if cell_index % 10 == 0:
+                print(f"  Run {run_index}/{n_runs}: 已完成 {cell_index}/{n_cells} 个细胞...")
 
     print()
     print("=" * 70)
     print("统计结果 SUMMARY")
     print("=" * 70)
-    print(f"完成捕捉的细胞: {completed_count}/{n_cells}")
+    print(f"完成捕捉的细胞: {completed_count}/{total_cells}")
     print()
     if mt_counts:
         print(f"全捕捉所需微管数: 平均 {_mean(mt_counts):.0f}, 中位数 {_median(mt_counts):.0f}, 标准差 {_pstdev(mt_counts):.0f}")
@@ -2052,10 +2986,29 @@ def run_boss_style_direct_output(
             print(f"  {int(m*100):>3}% ({int(math.ceil(m*TOTAL_KT_UNITS)):>2}/{TOTAL_KT_UNITS}): 平均 {mt_n:>8.0f} 根微管")
     print()
 
+    run_summary_rows: List[Dict[str, object]] = []
+    for run_index in range(1, n_runs + 1):
+        run_rows = [row for row in per_cell_summary if int(row["run"]) == run_index]
+        run_completed = [row for row in run_rows if bool(row["completed"])]
+        run_summary_rows.append({
+            "run": run_index,
+            "cells_requested": n_cells,
+            "cells_simulated": len(run_rows),
+            "completed_cells": sum(1 for row in run_completed if bool(row["completed"])),
+            "mean_completion_time_s": _mean([float(row["final_time"]) for row in run_completed]),
+            "mean_mt_total_emitted": _mean([int(row["n_mts"]) for row in run_completed]),
+            **condition_metadata(condition),
+        })
+    write_csv(os.path.join(output_dir, "run_summary.csv"), run_summary_rows)
+
     # Boss-style aggregate progression output.
     with open(os.path.join(output_dir, "aggregate_progression.csv"), "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
-        writer.writerow(["milestone_fraction", "kt_captured", "mean_time_s", "median_time_s", "mean_n_mts", "median_n_mts"])
+        writer.writerow([
+            "milestone_fraction", "kt_captured", "mean_time_s", "median_time_s",
+            "mean_n_mts", "median_n_mts", "condition_family", "pivoting_mode",
+            "d_mt_rad2_s",
+        ])
         for m in progress_milestones:
             if milestone_times[m]:
                 writer.writerow([
@@ -2065,25 +3018,44 @@ def run_boss_style_direct_output(
                     f"{_median(milestone_times[m]):.2f}",
                     f"{_mean(milestone_mts[m]):.1f}",
                     f"{_median(milestone_mts[m]):.1f}",
+                    condition.family,
+                    condition.pivoting_mode,
+                    condition.d_mt_rad2_s,
                 ])
 
     with open(os.path.join(output_dir, "per_cell_summary.csv"), "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
-        writer.writerow(["cell", "completed", "n_mts_total", "final_time_s", "final_time_min"])
+        writer.writerow([
+            "run", "cell", "global_cell", "completed", "n_mts_total",
+            "final_time_s", "final_time_min",
+            "condition", "condition_family", "pivoting_mode", "d_mt_rad2_s",
+        ])
         for s in per_cell_summary:
             writer.writerow([
+                s["run"],
                 s["cell"],
+                s["global_cell"],
                 s["completed"],
                 s["n_mts"],
                 f"{float(s['final_time']):.2f}",
                 f"{float(s['final_time'])/60:.2f}",
+                s["condition"],
+                s["condition_family"],
+                s["pivoting_mode"],
+                s["d_mt_rad2_s"],
             ])
 
     with open(os.path.join(output_dir, "distal_angles.csv"), "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
-        writer.writerow(["deflection_angle_deg"])
+        writer.writerow([
+            "deflection_angle_deg", "condition_family", "pivoting_mode",
+            "d_mt_rad2_s",
+        ])
         for a in all_dist_angles:
-            writer.writerow([f"{a:.3f}"])
+            writer.writerow([
+                f"{a:.3f}", condition.family, condition.pivoting_mode,
+                condition.d_mt_rad2_s,
+            ])
 
     # Extra reproducibility file: records the exact GUI/CLI parameters used for
     # this direct BOSS-style calculation. The four core CSVs above keep the same
@@ -2092,19 +3064,27 @@ def run_boss_style_direct_output(
         writer = csv.writer(f)
         writer.writerow(["parameter", "value"])
         writer.writerow(["condition", condition_label])
-        writer.writerow(["directed_fraction", f"{directed_prob:.6g}"])
-        writer.writerow(["directed_percent", f"{directed_prob * 100:.3f}"])
-        writer.writerow(["kt_generation_mode", params.kt_generation_mode])
-        writer.writerow(["kt_base_diameter_um", f"{params.kt_base_diameter_um:.3f}"])
-        writer.writerow(["kt_volume_multiplier", f"{params.kt_volume_multiplier:.2f}"])
-        writer.writerow(["kt_base_volume_um3", f"{params.kt_base_volume_um3:.6f}"])
-        writer.writerow(["kt_unit_diameter_um", f"{params.kt_diameter_um:.3f}"])
-        writer.writerow(["kt_effective_volume_um3", f"{params.kt_effective_volume_um3:.6f}"])
-        writer.writerow(["mt_diameter_um", f"{params.mt_diameter_um:.6f}"])
-        writer.writerow(["mt_velocity_um_s", f"{params.mt_velocity_um_s:.6f}"])
-        writer.writerow(["post_burst_emission_rate_per_centrosome_MT_per_s", f"{params.emission_rate_per_centrosome:.6f}"])
-        writer.writerow(["mt_extra_length_um", f"{params.mt_extra_length_um:.6f}"])
-        writer.writerow(["number_of_cells_or_repeats", n_cells])
+        writer.writerow(["condition_family", condition.family])
+        writer.writerow(["directed_fraction", f"{condition.directed_prob:.6g}"])
+        writer.writerow(["directed_percent", f"{condition.directed_prob * 100:.3f}"])
+        writer.writerow(["pivoting_mode", condition.pivoting_mode])
+        writer.writerow(["pivoting_parameter", condition_metadata(condition)["pivoting_parameter"]])
+        writer.writerow(["d_mt_rad2_s", f"{condition.d_mt_rad2_s:.9g}"])
+        writer.writerow(["pivot_dt_s", f"{PIVOT_DT_S:.6g}"])
+        writer.writerow(["theta_sample_dt_s", f"{THETA_SAMPLE_DT_S:.6g}"])
+        writer.writerow(["kt_generation_mode", sim_params.kt_generation_mode])
+        writer.writerow(["kt_base_diameter_um", f"{sim_params.kt_base_diameter_um:.3f}"])
+        writer.writerow(["kt_volume_multiplier", f"{sim_params.kt_volume_multiplier:.2f}"])
+        writer.writerow(["kt_base_volume_um3", f"{sim_params.kt_base_volume_um3:.6f}"])
+        writer.writerow(["kt_unit_diameter_um", f"{sim_params.kt_diameter_um:.3f}"])
+        writer.writerow(["kt_effective_volume_um3", f"{sim_params.kt_effective_volume_um3:.6f}"])
+        writer.writerow(["mt_diameter_um", f"{sim_params.mt_diameter_um:.6f}"])
+        writer.writerow(["mt_velocity_um_s", f"{sim_params.mt_velocity_um_s:.6f}"])
+        writer.writerow(["post_burst_emission_rate_per_centrosome_MT_per_s", f"{sim_params.emission_rate_per_centrosome:.6f}"])
+        writer.writerow(["mt_extra_length_um", f"{sim_params.mt_extra_length_um:.6f}"])
+        writer.writerow(["number_of_runs", n_runs])
+        writer.writerow(["cells_per_run", n_cells])
+        writer.writerow(["total_cells", total_cells])
         writer.writerow(["random_seed", params.seed])
         writer.writerow(["total_kt_units", TOTAL_KT_UNITS])
         writer.writerow(["distal_kt_units", DISTAL_KT_UNITS])
@@ -2121,15 +3101,22 @@ def run_boss_style_direct_output(
     print(f"  - cell_XXX_progression.csv : 每个细胞的捕捉进度(时间+微管数 vs 捕捉数)")
     print(f"  - aggregate_progression.csv: 各里程碑聚合(时间+微管数)")
     print(f"  - per_cell_summary.csv     : 每个细胞汇总")
+    print(f"  - run_summary.csv          : {n_runs} 次独立运行的汇总")
     print(f"  - distal_angles.csv        : distal 偏转角分布(用于作图)")
     print(f"  - parameters_used.csv      : 本次计算使用的参数记录")
     print("=" * 70)
 
     return {
         "condition": condition_label,
-        "directed_percent": directed_prob * 100.0,
+        "condition_family": condition.family,
+        "directed_percent": condition.directed_prob * 100.0,
+        "pivoting_mode": condition.pivoting_mode,
+        "pivoting_parameter": condition_metadata(condition)["pivoting_parameter"],
+        "d_mt_rad2_s": condition.d_mt_rad2_s,
         "completed_cells": completed_count,
-        "total_cells": n_cells,
+        "n_runs": n_runs,
+        "cells_per_run": n_cells,
+        "total_cells": total_cells,
         "mean_completion_time_s": _mean(times),
         "mean_deflection_angle_deg": _mean(all_angles),
         "mean_mt_total_emitted": _mean(mt_counts),
@@ -2150,16 +3137,24 @@ def _run_export_job(job: Dict[str, object]) -> Dict[str, object]:
     """
     params: SimulationParams = job["params"]  # type: ignore[assignment]
     rep = int(job["repeat"])
+    run_index = int(job.get("run", 1))
+    cell_index = int(job.get("cell", rep))
+    global_cell_index = int(job.get("global_cell", rep))
     layout_seed = int(job["layout_seed"])
     base_units: List[KTUnit] = job["base_units"]  # type: ignore[assignment]
-    cond_name = str(job["condition_name"])
-    prob = float(job["prob"])
+    condition = job.get("condition_spec")
+    if not isinstance(condition, ConditionSpec):
+        # Compatibility fallback for callers using the original worker shape.
+        cond_name = str(job["condition_name"])
+        prob = float(job["prob"])
+        condition = ConditionSpec(cond_name, prob)
+    sim_params = params_for_condition(params, condition)
     include_per_mt = bool(job.get("include_per_mt", False))
     collect_progression = bool(job.get("collect_progression", True))
     collect_deflection = bool(job.get("collect_deflection", True))
 
-    sim_seed = params.seed + rep * 100003 + int(round(prob * 1000)) + 17
-    sim = EventDrivenSimulator(params, prob, sim_seed, base_units)
+    sim_seed = params.seed + rep * 100003 + 17
+    sim = EventDrivenSimulator(sim_params, condition.directed_prob, sim_seed, base_units)
     result = sim.run()
     completed = bool(result["completed"])
     n_captured = int(result["n_captured"])
@@ -2167,11 +3162,13 @@ def _run_export_job(job: Dict[str, object]) -> Dict[str, object]:
     final_time = float(result["final_time_s"])
 
     common = {
+        "run": run_index,
+        "cell": cell_index,
+        "global_cell": global_cell_index,
         "repeat": rep,
         "layout_seed": layout_seed,
         "simulation_seed": sim_seed,
-        "condition": cond_name,
-        "directed_percent": prob * 100.0,
+        **condition_metadata(condition),
         "kt_generation_mode": params.kt_generation_mode,
         "kt_base_diameter_um": params.kt_base_diameter_um,
         "kt_volume_multiplier": params.kt_volume_multiplier,
@@ -2197,11 +3194,13 @@ def _run_export_job(job: Dict[str, object]) -> Dict[str, object]:
         "angular_occupancy_width_deg": math.degrees(sim.angular_width),
     }
     time_row = {
+        "run": run_index,
+        "cell": cell_index,
+        "global_cell": global_cell_index,
         "repeat": rep,
         "layout_seed": layout_seed,
         "simulation_seed": sim_seed,
-        "condition": cond_name,
-        "directed_percent": prob * 100.0,
+        **condition_metadata(condition),
         "completed": completed,
         "completion_time_s": final_time if completed else "",
     }
@@ -2229,14 +3228,19 @@ def _run_export_job(job: Dict[str, object]) -> Dict[str, object]:
                 "hit_count": len(mt.hits),
                 "hit_kt_indices": ";".join(str(h[0]) for h in mt.hits),
                 "hit_contact_distances_um": ";".join(f"{h[1]:.6g}" for h in mt.hits),
+                "hit_capture_modes": ";".join(mt.hit_capture_modes),
                 "no_hit_deflection_to_boundary_deg": "" if mt.no_hit_deflection is None else mt.no_hit_deflection,
                 "nearest_kt_index": "" if mt.nearest_kt_index is None else mt.nearest_kt_index,
+                "pivot_step_count": mt.pivot_step_count,
+                "final_dir_x": "" if mt.final_direction is None else mt.final_direction[0],
+                "final_dir_y": "" if mt.final_direction is None else mt.final_direction[1],
+                "final_dir_z": "" if mt.final_direction is None else mt.final_direction[2],
                 "dir_x": mt.direction[0], "dir_y": mt.direction[1], "dir_z": mt.direction[2],
             })
 
     return {
         "repeat": rep,
-        "condition": cond_name,
+        "condition": condition.name,
         "summary_row": summary_row,
         "time_row": time_row,
         "per_cell_row": per_cell_row,
@@ -2268,9 +3272,11 @@ class ResultsWindow(QWidget):
         title.setStyleSheet("font-size: 16px; font-weight: bold;")
         layout.addWidget(title)
 
-        table = QTableWidget(len(rows), 5)
+        table = QTableWidget(len(rows), 7)
         table.setHorizontalHeaderLabels([
             "Condition",
+            "Scheme",
+            "Pivoting parameter",
             "Completed cells",
             "Mean completion time (s)",
             "Mean deflection angle (°)",
@@ -2289,6 +3295,8 @@ class ResultsWindow(QWidget):
         for r, row in enumerate(rows):
             values = [
                 str(row.get("condition", "")),
+                str(row.get("condition_family", "")),
+                str(row.get("pivoting_parameter", "none")),
                 f"{row.get('completed_cells', '')}/{row.get('total_cells', '')}",
                 fmt(row.get("mean_completion_time_s", float('nan')), 2),
                 fmt(row.get("mean_deflection_angle_deg", float('nan')), 2),
@@ -2313,6 +3321,7 @@ def run_direct_from_cli(argv: Sequence[str]) -> None:
     parser.add_argument("--direct", action="store_true", help="Run direct output mode instead of opening the GUI.")
     parser.add_argument("--f-directed", type=float, default=DIRECT_F_DIRECTED, help="Directed fraction, e.g. 0, 0.2, 0.4, 0.6, 0.8, 1.0.")
     parser.add_argument("--n-cells", type=int, default=DIRECT_N_CELLS)
+    parser.add_argument("--n-runs", type=int, default=DIRECT_N_RUNS, help="Independent runs; each run contains --n-cells cells.")
     parser.add_argument("--output-dir", default=DIRECT_OUTPUT_DIR)
     parser.add_argument("--kt-diameter", type=float, default=0.80, help="Base KT unit diameter in um before volume scaling.")
     parser.add_argument("--kt-volume-multiplier", type=float, default=1.0, help="KT capture volume multiplier. Effective diameter = base diameter * multiplier^(1/3).")
@@ -2320,6 +3329,15 @@ def run_direct_from_cli(argv: Sequence[str]) -> None:
     parser.add_argument("--mt-velocity", type=float, default=0.116, help="MT growth velocity in um/s.")
     parser.add_argument("--emission-rate", type=float, default=0.15, help="Post-burst emission rate per centrosome, MT/s.")
     parser.add_argument("--mt-extra-length", type=float, default=1.0, help="Max MT length = max CS-to-KT distance + this value.")
+    parser.add_argument(
+        "--pivoting-sweep", choices=("none", "dmt"), default="none",
+        help="Run the exact six-condition D_MT pivoting sweep.",
+    )
+    parser.add_argument(
+        "--pivoting-mode", choices=("none", "dmt"), default="none",
+        help="Run one condition when --pivoting-sweep=none.",
+    )
+    parser.add_argument("--d-mt", type=float, default=1e-4, help="D_MT in rad^2/s for one dmt condition.")
     args = parser.parse_args(list(argv))
 
     kt_base_d = max(0.10, min(2.50, float(args.kt_diameter)))
@@ -2334,12 +3352,34 @@ def run_direct_from_cli(argv: Sequence[str]) -> None:
         mt_extra_length_um=max(0.0, float(args.mt_extra_length)),
         seed=new_random_seed(),
     )
-    run_boss_style_direct_output(
-        params=params,
-        directed_prob=max(0.0, min(1.0, float(args.f_directed))),
-        n_cells=max(1, int(args.n_cells)),
-        output_dir=args.output_dir,
-    )
+    directed_prob = max(0.0, min(1.0, float(args.f_directed)))
+    if args.pivoting_sweep == "dmt":
+        conditions = [
+            ConditionSpec(name, 0.0, "dmt", value, "pivoting_dmt")
+            for name, value in PIVOTING_DMT_CONDITIONS
+        ]
+    elif args.pivoting_mode == "dmt":
+        value = max(0.0, float(args.d_mt))
+        conditions = [ConditionSpec(f"Pivoting D_MT = {value:.6g} rad^2/s", 0.0, "dmt", value, "pivoting_dmt")]
+    else:
+        conditions = [ConditionSpec(_condition_label_from_prob(directed_prob), directed_prob)]
+
+    for condition in conditions:
+        output_dir = args.output_dir
+        if len(conditions) > 1:
+            output_dir = os.path.join(
+                args.output_dir,
+                condition.family,
+                _sanitize_filename(condition.name),
+            )
+        run_boss_style_direct_output(
+            params=params,
+            directed_prob=condition.directed_prob,
+            n_cells=max(1, int(args.n_cells)),
+            n_runs=max(1, int(args.n_runs)),
+            output_dir=output_dir,
+            condition=condition,
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -2364,11 +3404,11 @@ class MainWindow(QWidget):
         self.animation_condition_combos: List[QComboBox] = []
         anim_box = QGroupBox("Animation conditions")
         anim_layout = QHBoxLayout()
-        default_indices = [0, next((i for i, (_, p) in enumerate(CONDITIONS) if abs(p - 0.40) < 1e-12), 0)]
+        default_indices = [0, next((i for i, spec in enumerate(ANIMATION_CONDITIONS) if abs(spec.directed_prob - 0.40) < 1e-12 and spec.pivoting_mode == "none"), 0)]
         for side, default_idx in zip(("Left", "Right"), default_indices):
             anim_layout.addWidget(QLabel(side))
             combo = QComboBox()
-            combo.addItems([name for name, _ in CONDITIONS])
+            combo.addItems([spec.name for spec in ANIMATION_CONDITIONS])
             combo.setCurrentIndex(default_idx)
             self.animation_condition_combos.append(combo)
             anim_layout.addWidget(combo, 1)
@@ -2569,10 +3609,17 @@ class MainWindow(QWidget):
         self.extra_len_spin.valueChanged.connect(lambda _: self.reset_animation(regenerate_layout=False))
         form.addRow("MT extra length (μm)", self.extra_len_spin)
 
+        self.runs_spin = QSpinBox()
+        self.runs_spin.setRange(1, 100)
+        self.runs_spin.setValue(DIRECT_N_RUNS)
+        self.runs_spin.setToolTip("Number of independent batch runs for every selected condition.")
+        form.addRow("Independent runs", self.runs_spin)
+
         self.repeats_spin = QSpinBox()
         self.repeats_spin.setRange(1, 10000)
-        self.repeats_spin.setValue(500)
-        form.addRow("Number of repeats", self.repeats_spin)
+        self.repeats_spin.setValue(DIRECT_N_CELLS)
+        self.repeats_spin.setToolTip("Number of cells simulated in each independent run.")
+        form.addRow("Cells per run", self.repeats_spin)
 
         self.workers_spin = QSpinBox()
         self.workers_spin.setRange(1, 12)
@@ -2593,6 +3640,17 @@ class MainWindow(QWidget):
             cond_layout.addWidget(cb)
         export_cond_box.setLayout(cond_layout)
         layout.addWidget(export_cond_box)
+
+        dmt_box = QGroupBox("Pivoting sweep: D_MT (rad²/s)")
+        dmt_layout = QVBoxLayout()
+        self.pivot_dmt_checks: List[QCheckBox] = []
+        for name, _ in PIVOTING_DMT_CONDITIONS:
+            cb = QCheckBox(name)
+            cb.setChecked(True)
+            self.pivot_dmt_checks.append(cb)
+            dmt_layout.addWidget(cb)
+        dmt_box.setLayout(dmt_layout)
+        layout.addWidget(dmt_box)
 
         outputs_box = QGroupBox("Outputs")
         outputs_layout = QVBoxLayout()
@@ -2686,23 +3744,33 @@ class MainWindow(QWidget):
     def _display_condition_name(self, name: str) -> str:
         return str(name).replace(" directed", " Directed")
 
-    def selected_animation_conditions(self) -> List[Tuple[str, float]]:
-        selected: List[Tuple[str, float]] = []
+    def selected_animation_conditions(self) -> List[ConditionSpec]:
+        selected: List[ConditionSpec] = []
         for combo in self.animation_condition_combos:
-            idx = max(0, min(len(CONDITIONS) - 1, int(combo.currentIndex())))
-            selected.append(CONDITIONS[idx])
+            idx = max(0, min(len(ANIMATION_CONDITIONS) - 1, int(combo.currentIndex())))
+            selected.append(ANIMATION_CONDITIONS[idx])
         return selected
 
-    def selected_animation_condition(self) -> Tuple[str, float]:
+    def selected_animation_condition(self) -> ConditionSpec:
         # Backward-compatible first-panel selection used by the SVG export.
         return self.selected_animation_conditions()[0]
 
     def update_condition_titles(self) -> None:
-        for label, (name, _) in zip(self.condition_title_labels, self.selected_animation_conditions()):
-            label.setText(self._display_condition_name(name))
+        for label, condition in zip(self.condition_title_labels, self.selected_animation_conditions()):
+            label.setText(self._display_condition_name(condition.name))
 
-    def selected_export_conditions(self) -> List[Tuple[str, float]]:
-        return [cond for cond, cb in zip(EXPORT_CONDITIONS, self.export_condition_checks) if cb.isChecked()]
+    def selected_export_conditions(self) -> List[ConditionSpec]:
+        selected = [
+            ConditionSpec(name, prob)
+            for (name, prob), cb in zip(EXPORT_CONDITIONS, self.export_condition_checks)
+            if cb.isChecked()
+        ]
+        selected.extend(
+            ConditionSpec(name, 0.0, "dmt", value, "pivoting_dmt")
+            for (name, value), cb in zip(PIVOTING_DMT_CONDITIONS, self.pivot_dmt_checks)
+            if cb.isChecked()
+        )
+        return selected
 
     def reset_animation(self, regenerate_layout: bool, force_new_seed: bool = False) -> None:
         # Both comparison conditions share one KT layout so only the directed
@@ -2721,9 +3789,14 @@ class MainWindow(QWidget):
         self.current_animation_seed = self.current_animation_seeds[0]
         conditions = self.selected_animation_conditions()
         self.update_condition_titles()
-        for i, (_, prob) in enumerate(conditions):
+        for i, condition in enumerate(conditions):
             self.views[i].set_simulation(
-                AnimationSimulation(params, prob, self.current_units, self.current_animation_seeds[i])
+                AnimationSimulation(
+                    params_for_condition(params, condition),
+                    condition.directed_prob,
+                    self.current_units,
+                    self.current_animation_seeds[i],
+                )
             )
             self.capture_time_plots[i].clear()
             self.mt_capture_plots[i].clear()
@@ -2795,7 +3868,8 @@ class MainWindow(QWidget):
             QMessageBox.information(self, "No export condition", "Please select at least one Export condition.")
             return
 
-        repeats = int(self.repeats_spin.value())
+        cells_per_run = int(self.repeats_spin.value())
+        n_runs = int(self.runs_spin.value())
         base_output_dir = os.path.join(os.getcwd(), DIRECT_OUTPUT_DIR)
 
         was_running = self.running
@@ -2809,17 +3883,19 @@ class MainWindow(QWidget):
             QApplication.processEvents()
 
             result_rows: List[Dict[str, object]] = []
-            for cond_name, prob in conditions:
+            for condition in conditions:
                 if len(conditions) == 1:
                     output_dir = base_output_dir
                 else:
-                    output_dir = os.path.join(base_output_dir, self._condition_output_folder_name(cond_name))
+                    output_dir = os.path.join(base_output_dir, self._condition_output_folder_name(condition.name))
                 result_rows.append(run_boss_style_direct_output(
                     params=params,
-                    directed_prob=prob,
-                    n_cells=repeats,
+                    directed_prob=condition.directed_prob,
+                    n_cells=cells_per_run,
+                    n_runs=n_runs,
                     output_dir=output_dir,
                     progress_milestones=PROGRESS_MILESTONES,
+                    condition=condition,
                 ))
         except Exception as e:
             QMessageBox.warning(self, "Direct output failed", str(e))
@@ -2907,7 +3983,7 @@ class MainWindow(QWidget):
             return
 
         conditions = self.selected_animation_conditions()
-        safe_pair = "_vs_".join(_sanitize_filename(name) for name, _ in conditions)
+        safe_pair = "_vs_".join(_sanitize_filename(condition.name) for condition in conditions)
         default_name = f"capture_movie_{safe_pair}.mp4"
         path, _ = QFileDialog.getSaveFileName(
             self,
@@ -2934,8 +4010,13 @@ class MainWindow(QWidget):
 
         params = self.current_params()
         export_sims = [
-            AnimationSimulation(params, prob, self.current_units, self.current_animation_seeds[i])
-            for i, (_, prob) in enumerate(conditions)
+            AnimationSimulation(
+                params_for_condition(params, condition),
+                condition.directed_prob,
+                self.current_units,
+                self.current_animation_seeds[i],
+            )
+            for i, condition in enumerate(conditions)
         ]
         export_widget = DualComparisonExportWidget(conditions, export_sims, self.views)
         export_widget.update_frame(initial_acceleration)
@@ -3020,9 +4101,9 @@ class MainWindow(QWidget):
 
                 if frame_count % 10 == 0:
                     cap_text = "   |   ".join(
-                        f"{self._display_condition_name(name)}: "
+                        f"{self._display_condition_name(condition.name)}: "
                         f"{sum(1 for k in sim.kt_units if k.displayed_captured)}/{TOTAL_KT_UNITS}"
-                        for (name, _), sim in zip(conditions, export_sims)
+                        for condition, sim in zip(conditions, export_sims)
                     )
                     progress.setLabelText(
                         f"{cap_text}\n"
@@ -3116,8 +4197,8 @@ class MainWindow(QWidget):
         QMessageBox.information(
             self, "Video export complete",
             f"Exported dual-condition Movie S10 comparison to:\n{path}\n\n"
-            f"Conditions: {self._display_condition_name(conditions[0][0])} vs "
-            f"{self._display_condition_name(conditions[1][0])}\n"
+            f"Conditions: {self._display_condition_name(conditions[0].name)} vs "
+            f"{self._display_condition_name(conditions[1].name)}\n"
             f"FPS: {fps}\n"
             f"Time acceleration used: {min_acceleration_used}×–{max_acceleration_used}×\n"
             f"Direct high-resolution render: {physical_w} x {physical_h} px\n"
@@ -3145,8 +4226,8 @@ class MainWindow(QWidget):
             self.timer.stop()
             self.start_btn.setText("Start")
 
-        condition_name, _ = self.selected_animation_condition()
-        safe_condition = _sanitize_filename(condition_name)
+        condition = self.selected_animation_condition()
+        safe_condition = _sanitize_filename(condition.name)
         default_name = f"animation_frame_{safe_condition}_{sim.time:.1f}s.svg"
         default_path = os.path.join(os.getcwd(), default_name)
         path, _ = QFileDialog.getSaveFileName(
@@ -3227,10 +4308,11 @@ class MainWindow(QWidget):
         params = self.current_params()
         # Fresh base seed for this export, so separate export runs no longer reproduce identical tables.
         params.seed = new_random_seed()
-        repeats = int(self.repeats_spin.value())
+        n_runs = int(self.runs_spin.value())
+        cells_per_run = int(self.repeats_spin.value())
         workers = min(12, max(1, int(self.workers_spin.value())))
-        total_jobs = repeats * len(conditions)
-        condition_order = [name for name, _ in conditions]
+        total_jobs = n_runs * cells_per_run * len(conditions)
+        condition_order = [condition.name for condition in conditions]
         condition_rank = {name: i for i, name in enumerate(condition_order)}
 
         selected_output_checks = [
@@ -3256,6 +4338,7 @@ class MainWindow(QWidget):
         progress.setMinimumDuration(0)
 
         summary_rows: List[Dict[str, object]] = []
+        run_summary_rows: List[Dict[str, object]] = []
         time_rows: List[Dict[str, object]] = []
         mt_total_rows: List[Dict[str, object]] = []
         per_cell_rows: List[Dict[str, object]] = []
@@ -3271,39 +4354,46 @@ class MainWindow(QWidget):
         # run in parallel.
         jobs: List[Dict[str, object]] = []
         try:
-            for rep in range(1, repeats + 1):
-                layout_seed = params.seed + rep * 100003
-                base_units = generate_kt_layout(params, layout_seed)
+            for run_index in range(1, n_runs + 1):
+                for cell_index in range(1, cells_per_run + 1):
+                    global_cell_index = (run_index - 1) * cells_per_run + cell_index
+                    layout_seed = params.seed + global_cell_index * 100003
+                    base_units = generate_kt_layout(params, layout_seed)
 
-                if self.out_kt_layout.isChecked():
-                    for kt in base_units:
-                        kt_layout_rows.append({
-                            "repeat": rep,
+                    if self.out_kt_layout.isChecked():
+                        for kt in base_units:
+                            kt_layout_rows.append({
+                                "run": run_index,
+                                "cell": cell_index,
+                                "global_cell": global_cell_index,
+                                "repeat": global_cell_index,
+                                "layout_seed": layout_seed,
+                                "kt_index": kt.index,
+                                "x": kt.pos[0], "y": kt.pos[1], "z": kt.pos[2],
+                                "is_distal": kt.is_distal,
+                                "kt_group": kt.group,
+                                "kt_generation_mode": params.kt_generation_mode,
+                                "kt_base_diameter_um": params.kt_base_diameter_um,
+                                "kt_volume_multiplier": params.kt_volume_multiplier,
+                                "kt_base_volume_um3": params.kt_base_volume_um3,
+                                "kt_unit_diameter_um": params.kt_diameter_um,
+                                "kt_effective_volume_um3": params.kt_effective_volume_um3,
+                            })
+
+                    for condition in conditions:
+                        jobs.append({
+                            "params": params,
+                            "repeat": global_cell_index,
+                            "run": run_index,
+                            "cell": cell_index,
+                            "global_cell": global_cell_index,
                             "layout_seed": layout_seed,
-                            "kt_index": kt.index,
-                            "x": kt.pos[0], "y": kt.pos[1], "z": kt.pos[2],
-                            "is_distal": kt.is_distal,
-                            "kt_group": kt.group,
-                            "kt_generation_mode": params.kt_generation_mode,
-                            "kt_base_diameter_um": params.kt_base_diameter_um,
-                            "kt_volume_multiplier": params.kt_volume_multiplier,
-                            "kt_base_volume_um3": params.kt_base_volume_um3,
-                            "kt_unit_diameter_um": params.kt_diameter_um,
-                            "kt_effective_volume_um3": params.kt_effective_volume_um3,
+                            "base_units": base_units,
+                            "condition_spec": condition,
+                            "include_per_mt": include_per_mt,
+                            "collect_progression": collect_progression,
+                            "collect_deflection": collect_deflection,
                         })
-
-                for cond_name, prob in conditions:
-                    jobs.append({
-                        "params": params,
-                        "repeat": rep,
-                        "layout_seed": layout_seed,
-                        "base_units": base_units,
-                        "condition_name": cond_name,
-                        "prob": prob,
-                        "include_per_mt": include_per_mt,
-                        "collect_progression": collect_progression,
-                        "collect_deflection": collect_deflection,
-                    })
         except Exception as e:
             QMessageBox.warning(self, "KT layout generation failed", str(e))
             return
@@ -3331,7 +4421,7 @@ class MainWindow(QWidget):
                     QApplication.processEvents()
             else:
                 with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
-                    future_to_key = {executor.submit(_run_export_job, job): (job["repeat"], job["condition_name"]) for job in jobs}
+                    future_to_key = {executor.submit(_run_export_job, job): (job["repeat"], job["condition_spec"].name) for job in jobs}
                     for future in concurrent.futures.as_completed(future_to_key):
                         if progress.wasCanceled():
                             for f in future_to_key:
@@ -3363,11 +4453,18 @@ class MainWindow(QWidget):
         summary_rows.sort(key=lambda r: (safe_int(r.get("repeat", 0)), cond_idx(r)))
         time_rows.sort(key=lambda r: (safe_int(r.get("repeat", 0)), cond_idx(r)))
         mt_total_rows = [{
+            "run": r.get("run", ""),
+            "cell": r.get("cell", ""),
+            "global_cell": r.get("global_cell", ""),
             "repeat": r.get("repeat", ""),
             "layout_seed": r.get("layout_seed", ""),
             "simulation_seed": r.get("simulation_seed", ""),
             "condition": r.get("condition", ""),
+            "condition_family": r.get("condition_family", ""),
             "directed_percent": r.get("directed_percent", ""),
+            "pivoting_mode": r.get("pivoting_mode", ""),
+            "pivoting_parameter": r.get("pivoting_parameter", ""),
+            "d_mt_rad2_s": r.get("d_mt_rad2_s", ""),
             "completed": r.get("completed", ""),
             "mt_total_emitted": r.get("mt_total_emitted", ""),
         } for r in summary_rows]
@@ -3380,12 +4477,41 @@ class MainWindow(QWidget):
         deflection_rows.sort(key=lambda r: (safe_int(r.get("repeat", 0)), cond_idx(r), safe_int(r.get("mt_id", 0))))
         per_mt_rows.sort(key=lambda r: (safe_int(r.get("repeat", 0)), cond_idx(r), safe_int(r.get("mt_id", 0))))
 
+        for run_index in range(1, n_runs + 1):
+            for condition in conditions:
+                condition_rows = [
+                    row for row in summary_rows
+                    if int(row.get("run", 0)) == run_index
+                    and str(row.get("condition", "")) == condition.name
+                ]
+                completed_condition_rows = [
+                    row for row in condition_rows if bool(row.get("completed", False))
+                ]
+                run_summary_rows.append({
+                    "run": run_index,
+                    "cells_requested": cells_per_run,
+                    "cells_simulated": len(condition_rows),
+                    "completed_cells": len(completed_condition_rows),
+                    "mean_completion_time_s": _mean([
+                        float(row["completion_time_s"])
+                        for row in completed_condition_rows
+                        if _safe_float(row.get("completion_time_s")) is not None
+                    ]),
+                    "mean_mt_total_emitted": _mean([
+                        float(row["mt_total_emitted"])
+                        for row in completed_condition_rows
+                        if _safe_float(row.get("mt_total_emitted")) is not None
+                    ]),
+                    **condition_metadata(condition),
+                })
+
         if self.out_time.isChecked():
             write_csv(os.path.join(out_dir, "completion_time_s.csv"), time_rows)
         if self.out_mt_total.isChecked():
             write_csv(os.path.join(out_dir, "mt_total_emitted.csv"), mt_total_rows)
         if self.out_summary.isChecked():
             write_csv(os.path.join(out_dir, "summary.csv"), summary_rows)
+            write_csv(os.path.join(out_dir, "run_summary.csv"), run_summary_rows)
         if self.out_per_cell.isChecked():
             write_csv(os.path.join(out_dir, "per_cell_summary.csv"), per_cell_rows)
         if self.out_progress.isChecked():
@@ -3404,10 +4530,16 @@ class MainWindow(QWidget):
                 "post_burst_emission_rate_per_centrosome_MT_per_s": params.emission_rate_per_centrosome,
                 "mt_velocity_um_s": params.mt_velocity_um_s,
                 "mt_extra_length_um": params.mt_extra_length_um,
-                "number_of_repeats": repeats,
+                "pivot_dt_s": PIVOT_DT_S,
+                "theta_sample_dt_s": THETA_SAMPLE_DT_S,
+                "pivoting_schemes": "dmt",
+                "d_mt_conditions_rad2_s": ";".join(f"{value:.9g}" for _, value in PIVOTING_DMT_CONDITIONS),
+                "number_of_runs": n_runs,
+                "cells_per_run": cells_per_run,
+                "total_cells_per_condition": n_runs * cells_per_run,
                 "seed_mode": "automatic_random_each_export",
                 "auto_random_seed_for_this_export": params.seed,
-                "export_conditions": ";".join(name for name, _ in conditions),
+                "export_conditions": ";".join(condition.name for condition in conditions),
                 "output_completion_time": self.out_time.isChecked(),
                 "output_mt_total_emitted": self.out_mt_total.isChecked(),
                 "export_workers": workers,
@@ -3424,6 +4556,70 @@ class MainWindow(QWidget):
             write_csv(os.path.join(out_dir, "per_mt_details.csv"), per_mt_rows)
         if self.out_kt_layout.isChecked():
             write_csv(os.path.join(out_dir, "kt_layout.csv"), kt_layout_rows)
+
+        # Keep the two pivoting sweeps physically separate as well as
+        # distinguishable by columns in the combined tables.  Random/Directed
+        # output remains in the original top-level files.
+        if self.out_parameters.isChecked():
+            manifest_rows = [condition_metadata(condition) for condition in conditions]
+            write_csv(os.path.join(out_dir, "condition_manifest.csv"), manifest_rows)
+
+        family_dirs = {
+            "pivoting_dmt": "Pivoting_DMT",
+        }
+        for family, family_dir_name in family_dirs.items():
+            family_conditions = [
+                condition.name for condition in conditions if condition.family == family
+            ]
+            if not family_conditions:
+                continue
+            family_dir = os.path.join(out_dir, family_dir_name)
+            family_summary = [r for r in summary_rows if r.get("condition_family") == family]
+            family_time = [r for r in time_rows if r.get("condition_family") == family]
+            family_mt_total = [r for r in mt_total_rows if r.get("condition_family") == family]
+            family_per_cell = [r for r in per_cell_rows if r.get("condition_family") == family]
+            family_run_summary = [r for r in run_summary_rows if r.get("condition_family") == family]
+            family_progression = [r for r in progression_rows if r.get("condition_family") == family]
+            family_deflection = [r for r in deflection_rows if r.get("condition_family") == family]
+            family_per_mt = [r for r in per_mt_rows if r.get("condition_family") == family]
+            if self.out_time.isChecked():
+                write_csv(os.path.join(family_dir, "completion_time_s.csv"), family_time)
+            if self.out_mt_total.isChecked():
+                write_csv(os.path.join(family_dir, "mt_total_emitted.csv"), family_mt_total)
+            if self.out_summary.isChecked():
+                write_csv(os.path.join(family_dir, "summary.csv"), family_summary)
+                write_csv(os.path.join(family_dir, "run_summary.csv"), family_run_summary)
+            if self.out_per_cell.isChecked():
+                write_csv(os.path.join(family_dir, "per_cell_summary.csv"), family_per_cell)
+            if self.out_progress.isChecked():
+                write_csv(os.path.join(family_dir, "capture_progression.csv"), family_progression)
+            if self.out_deflection.isChecked():
+                write_csv(os.path.join(family_dir, "deflection_angles.csv"), family_deflection)
+            if self.out_per_mt.isChecked():
+                write_csv(os.path.join(family_dir, "per_mt_details.csv"), family_per_mt)
+            if self.out_parameters.isChecked():
+                family_parameter_row = dict(parameters_rows[0]) if parameters_rows else {}
+                family_parameter_row.update({
+                    "condition_family": family,
+                    "export_conditions": ";".join(family_conditions),
+                })
+                write_csv(os.path.join(family_dir, "parameters_used.csv"), [family_parameter_row])
+            if metric_only:
+                generate_metric_only_superplot_ready_tables(
+                    output_dir=family_dir,
+                    condition_order=family_conditions,
+                    summary_rows=family_summary,
+                    include_time=self.out_time.isChecked(),
+                    include_mt_total=self.out_mt_total.isChecked(),
+                )
+            else:
+                generate_superplot_ready_tables(
+                    output_dir=family_dir,
+                    condition_order=family_conditions,
+                    summary_rows=family_summary,
+                    progression_rows=family_progression,
+                    deflection_rows=family_deflection,
+                )
 
         try:
             if metric_only:
@@ -3470,7 +4666,7 @@ def main() -> None:
 
     if not QT_AVAILABLE:
         print("PySide6 is required for GUI mode. Install it with: pip install PySide6")
-        print("For direct output without GUI, run: python ME_BOSS_hybrid_KTunit_GUI.py --direct")
+        print("For direct output without GUI, run: python random_directed_microtubule_kinetochore_capture_3D_simulation_unified_engine.py --direct")
         sys.exit(1)
 
     app = QApplication(sys.argv)
